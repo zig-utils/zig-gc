@@ -14,8 +14,14 @@
 //!   fn trace(cell: *anyopaque, kind: Kind, v: anytype) void; // mark a cell's edges
 //!   fn finalize(ctx: *B, cell: *anyopaque, kind: Kind) void; // a cell is dying
 //!
+//! Optional hooks:
+//!   fn traceEphemeron(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
+//!   fn afterWeak(ctx: *B, cell: *anyopaque, kind: Kind) void;
+//!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
+//! `traceEphemeron` may call `v.isMarked(key)` and then `v.mark(value)` for
+//! WeakMap-style key/value edges.
 
 const std = @import("std");
 
@@ -27,7 +33,9 @@ pub fn Heap(comptime Binding: type) type {
         /// One machine-word-ish header in front of every cell: the all-cells
         /// list link, the payload size (to free), the kind tag (to dispatch
         /// trace/finalize without RTTI), and the mark bit.
+        const header_magic: u64 = 0x7a67_6763_5f68_6561;
         pub const Header = struct {
+            magic: u64,
             next: ?*Header,
             size: usize,
             kind: Kind,
@@ -51,6 +59,7 @@ pub fn Heap(comptime Binding: type) type {
         threshold_bytes: usize = 64 * 1024,
         mark_stack: std.ArrayListUnmanaged(*Header) = .empty,
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
+        marked_count: usize = 0,
         collections: usize = 0,
 
         pub const Visitor = struct {
@@ -65,11 +74,34 @@ pub fn Heap(comptime Binding: type) type {
             pub fn mark(v: *Visitor, cell: ?*anyopaque) void {
                 const p = cell orelse return;
                 const h = Self.headerOf(p);
+                if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
                 if (h.marked) return;
                 h.marked = true;
+                v.heap.marked_count += 1;
                 v.heap.mark_stack.append(v.heap.backing, h) catch {
                     v.oom = true;
                 };
+            }
+
+            /// Whether `cell` is one of this heap's managed payloads. Bindings use
+            /// this before marking legacy/embedder pointers that may still point
+            /// outside the GC heap.
+            pub fn isManaged(v: *Visitor, cell: ?*anyopaque) bool {
+                const p = cell orelse return false;
+                var it = v.heap.all;
+                while (it) |h| : (it = h.next) {
+                    if (payloadOf(h) == p) return true;
+                }
+                return false;
+            }
+
+            /// Whether a cell is already black/grey in the current collection.
+            /// Used by ephemeron tables: if the key is live, the value is a
+            /// strong edge; if the key stays white, the entry is weak.
+            pub fn isMarked(v: *Visitor, cell: ?*anyopaque) bool {
+                _ = v;
+                const p = cell orelse return false;
+                return Self.headerOf(p).marked;
             }
 
             /// Register a weak slot. After marking completes, if its target
@@ -103,7 +135,7 @@ pub fn Heap(comptime Binding: type) type {
             const total = header_stride + @sizeOf(T);
             const slab = try self.backing.alignedAlloc(u8, .@"16", total);
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
-            h.* = .{ .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = false };
+            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = false };
             self.all = h;
             self.live_cells += 1;
             self.bytes_live += total;
@@ -122,6 +154,7 @@ pub fn Heap(comptime Binding: type) type {
             // 1. all cells white.
             var it = self.all;
             while (it) |h| : (it = h.next) h.marked = false;
+            self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             self.weak_slots.clearRetainingCapacity();
 
@@ -132,11 +165,35 @@ pub fn Heap(comptime Binding: type) type {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
 
+            // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
+            // marked key, its value becomes strong. Iterate to a fixed point so
+            // values can keep further keys alive through chains of weak maps.
+            if (@hasDecl(Binding, "traceEphemeron")) {
+                while (true) {
+                    const before = self.marked_count;
+                    var eit = self.all;
+                    while (eit) |h| : (eit = h.next) {
+                        if (h.marked) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, &v);
+                    }
+                    while (self.mark_stack.pop()) |h| {
+                        Binding.trace(payloadOf(h), h.kind, &v);
+                    }
+                    if (self.marked_count == before) break;
+                }
+            }
+
             // 3. weak edges whose target died are cleared *before* the sweep
             //    frees it, so no slot ever dangles.
             for (self.weak_slots.items) |slot| {
                 if (slot.*) |target| {
                     if (!headerOf(target).marked) slot.* = null;
+                }
+            }
+
+            if (@hasDecl(Binding, "afterWeak")) {
+                var wit = self.all;
+                while (wit) |h| : (wit = h.next) {
+                    if (h.marked) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
                 }
             }
 
@@ -282,4 +339,122 @@ test "deinit finalizes every remaining cell" {
 
     heap.deinit(); // no roots → everything is garbage, all finalized
     try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
+}
+
+const EphRT = struct {
+    pub const Kind = enum { node, table };
+
+    const Node = struct {
+        strong: ?*Node = null,
+        id: u32 = 0,
+    };
+    const Entry = struct {
+        key: ?*Node = null,
+        value: ?*Node = null,
+    };
+    const Table = struct {
+        entries: std.ArrayListUnmanaged(Entry) = .empty,
+    };
+
+    roots: std.ArrayListUnmanaged(*anyopaque) = .empty,
+    finalized: std.ArrayListUnmanaged(u32) = .empty,
+
+    pub fn traceRoots(self: *EphRT, v: anytype) void {
+        for (self.roots.items) |r| v.mark(r);
+    }
+
+    pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
+        switch (kind) {
+            .node => {
+                const n: *Node = @ptrCast(@alignCast(cell));
+                v.mark(n.strong);
+            },
+            .table => {
+                const t: *Table = @ptrCast(@alignCast(cell));
+                for (t.entries.items) |*e| v.markWeak(@ptrCast(&e.key));
+            },
+        }
+    }
+
+    pub fn traceEphemeron(self: *EphRT, cell: *anyopaque, kind: Kind, v: anytype) void {
+        _ = self;
+        switch (kind) {
+            .node => {},
+            .table => {
+                const t: *Table = @ptrCast(@alignCast(cell));
+                for (t.entries.items) |e| {
+                    if (v.isMarked(e.key)) v.mark(e.value);
+                }
+            },
+        }
+    }
+
+    pub fn afterWeak(self: *EphRT, cell: *anyopaque, kind: Kind) void {
+        _ = self;
+        switch (kind) {
+            .node => {},
+            .table => {
+                const t: *Table = @ptrCast(@alignCast(cell));
+                var i: usize = 0;
+                while (i < t.entries.items.len) {
+                    if (t.entries.items[i].key == null) {
+                        _ = t.entries.orderedRemove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            },
+        }
+    }
+
+    pub fn finalize(self: *EphRT, cell: *anyopaque, kind: Kind) void {
+        switch (kind) {
+            .node => {
+                const n: *Node = @ptrCast(@alignCast(cell));
+                self.finalized.append(std.testing.allocator, n.id) catch {};
+            },
+            .table => {
+                const t: *Table = @ptrCast(@alignCast(cell));
+                t.entries.deinit(std.testing.allocator);
+            },
+        }
+    }
+};
+
+test "mark-sweep: ephemeron values stay live only while keys are live" {
+    const a = std.testing.allocator;
+    var rt = EphRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(EphRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = EphRT.Node;
+    const T = EphRT.Table;
+    const key = try heap.create(N, .node);
+    key.* = .{ .id = 1 };
+    const value = try heap.create(N, .node);
+    value.* = .{ .id = 2 };
+    const dead_key = try heap.create(N, .node);
+    dead_key.* = .{ .id = 3 };
+    const dead_value = try heap.create(N, .node);
+    dead_value.* = .{ .id = 4 };
+    const table = try heap.create(T, .table);
+    table.* = .{};
+    try table.entries.append(a, .{ .key = key, .value = value });
+    try table.entries.append(a, .{ .key = dead_key, .value = dead_value });
+    try rt.roots.append(a, table);
+    try rt.roots.append(a, key);
+
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(key, table.entries.items[0].key.?);
+    try std.testing.expectEqual(value, table.entries.items[0].value.?);
+
+    _ = rt.roots.pop();
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
 }
