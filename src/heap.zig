@@ -88,11 +88,7 @@ pub fn Heap(comptime Binding: type) type {
             /// outside the GC heap.
             pub fn isManaged(v: *Visitor, cell: ?*anyopaque) bool {
                 const p = cell orelse return false;
-                var it = v.heap.all;
-                while (it) |h| : (it = h.next) {
-                    if (payloadOf(h) == p) return true;
-                }
-                return false;
+                return v.heap.headerForPayload(p) != null;
             }
 
             /// Whether a cell is already black/grey in the current collection.
@@ -102,6 +98,29 @@ pub fn Heap(comptime Binding: type) type {
                 _ = v;
                 const p = cell orelse return false;
                 return Self.headerOf(p).marked;
+            }
+
+            /// Conservatively mark a machine word if it points at the payload
+            /// of a managed cell. This is intentionally opt-in: precise
+            /// embedders should keep using `mark`, while runtimes that need to
+            /// root native stacks can scan a stack/register spill range without
+            /// teaching the collector about their frame layout.
+            pub fn markConservativeWord(v: *Visitor, word: usize) void {
+                const h = v.heap.headerForInteriorAddress(word) orelse return;
+                if (h.marked) return;
+                h.marked = true;
+                v.heap.marked_count += 1;
+                v.heap.mark_stack.append(v.heap.backing, h) catch {
+                    v.oom = true;
+                };
+            }
+
+            /// Scan a word-aligned range, inclusive of `start` and spanning
+            /// `words` machine words. The caller owns choosing safe stack or
+            /// register-spill bounds for its platform.
+            pub fn markConservativeWords(v: *Visitor, start: [*]const usize, words: usize) void {
+                var i: usize = 0;
+                while (i < words) : (i += 1) v.markConservativeWord(start[i]);
             }
 
             /// Register a weak slot. After marking completes, if its target
@@ -125,6 +144,24 @@ pub fn Heap(comptime Binding: type) type {
         fn payloadOf(h: *Header) *anyopaque {
             const raw: [*]u8 = @ptrCast(h);
             return @ptrCast(raw + header_stride);
+        }
+
+        fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
+            var it = self.all;
+            while (it) |h| : (it = h.next) {
+                if (payloadOf(h) == payload) return h;
+            }
+            return null;
+        }
+
+        fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
+            var it = self.all;
+            while (it) |h| : (it = h.next) {
+                const start = @intFromPtr(payloadOf(h));
+                const end = start + h.size;
+                if (address >= start and address < end) return h;
+            }
+            return null;
         }
 
         /// Allocate a GC-managed cell of type `T` tagged `kind`. The returned
@@ -258,9 +295,11 @@ const TestRT = struct {
 
     roots: std.ArrayListUnmanaged(*Node) = .empty,
     finalized: std.ArrayListUnmanaged(u32) = .empty,
+    conservative_words: []const usize = &.{},
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
+        for (self.conservative_words) |word| v.markConservativeWord(word);
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -339,6 +378,33 @@ test "deinit finalizes every remaining cell" {
 
     heap.deinit(); // no roots → everything is garbage, all finalized
     try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
+}
+
+test "mark-sweep: optional conservative words root payload and interior pointers" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const A = try heap.create(TestRT.Node, .node);
+    A.* = .{ .id = 1 };
+    const B = try heap.create(TestRT.Node, .node);
+    B.* = .{ .id = 2 };
+    const C = try heap.create(TestRT.Node, .node);
+    C.* = .{ .id = 3 };
+
+    const b_interior = @intFromPtr(B) + @offsetOf(TestRT.Node, "id");
+    const words = [_]usize{ @intFromPtr(A), b_interior, 0x1234 };
+    rt.conservative_words = &words;
+
+    heap.collect();
+
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
 }
 
 const EphRT = struct {

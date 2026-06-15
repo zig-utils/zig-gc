@@ -38,6 +38,13 @@ Inside `traceRoots`/`trace`, call `v.mark(ptr)` for each strong reference and
 whose target dies is set to `null` *before* the target's storage is freed, so it
 never dangles.
 
+Embedders that need to root native stack or register-spill words can opt into
+conservative marking from `traceRoots` with `v.markConservativeWord(word)` or
+`v.markConservativeWords(start, count)`. Exact payload pointers and interior
+payload pointers keep the owning cell alive; unrelated words are ignored. This
+does not replace precise heap tracing — it is a stack-root escape hatch for
+runtimes whose frame layout is not fully described yet.
+
 ## Usage
 
 ```zig
