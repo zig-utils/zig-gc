@@ -61,6 +61,16 @@ pub fn Heap(comptime Binding: type) type {
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
         marked_count: usize = 0,
         collections: usize = 0,
+        /// Address-sorted snapshot of live cell extents, used to answer interior
+        /// pointer queries (`markConservativeWord`) in O(log n) instead of an
+        /// O(n) walk of the `all` list per word. Built lazily on the first
+        /// conservative mark within a collection (so precise collections never
+        /// pay for it) and reused for the rest of that collection's mark phase,
+        /// which neither allocates nor frees cells. See `headerForInteriorAddress`.
+        addr_index: std.ArrayListUnmanaged(AddrEntry) = .empty,
+        addr_index_built: bool = false,
+
+        const AddrEntry = struct { start: usize, end: usize, header: *Header };
 
         pub const Visitor = struct {
             heap: *Self,
@@ -155,13 +165,50 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
+            // Lazily build the address-sorted index on first use within a
+            // collection (reset by `collect`). The mark phase never allocates or
+            // frees cells, so a snapshot stays valid for the whole phase.
+            if (!self.addr_index_built) self.buildAddrIndex();
+            const items = self.addr_index.items;
+            // Binary search for the rightmost extent whose `start <= address`.
+            var lo: usize = 0;
+            var hi: usize = items.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (items[mid].start <= address) lo = mid + 1 else hi = mid;
+            }
+            if (lo == 0) return null;
+            const e = items[lo - 1];
+            if (address < e.end) return e.header;
+            return null;
+        }
+
+        fn buildAddrIndex(self: *Self) void {
+            self.addr_index.clearRetainingCapacity();
             var it = self.all;
             while (it) |h| : (it = h.next) {
                 const start = @intFromPtr(payloadOf(h));
-                const end = start + h.size;
-                if (address >= start and address < end) return h;
+                // A zero-size payload would make an empty extent that no interior
+                // address can fall into; record at least one byte so an exact
+                // payload pointer still resolves.
+                const size = if (h.size == 0) 1 else h.size;
+                self.addr_index.append(self.backing, .{
+                    .start = start,
+                    .end = start + size,
+                    .header = h,
+                }) catch {
+                    // On OOM, fall back to leaving the index partial; a missed
+                    // interior pointer is a missed (conservative) root, which is
+                    // unsound, so panic rather than silently under-mark.
+                    std.debug.panic("GC: out of memory building conservative address index", .{});
+                };
             }
-            return null;
+            std.mem.sort(AddrEntry, self.addr_index.items, {}, struct {
+                fn lessThan(_: void, a: AddrEntry, b: AddrEntry) bool {
+                    return a.start < b.start;
+                }
+            }.lessThan);
+            self.addr_index_built = true;
         }
 
         /// Allocate a GC-managed cell of type `T` tagged `kind`. The returned
@@ -194,6 +241,9 @@ pub fn Heap(comptime Binding: type) type {
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             self.weak_slots.clearRetainingCapacity();
+            // The conservative interior-pointer index is rebuilt on demand for
+            // this collection (only if a conservative mark actually occurs).
+            self.addr_index_built = false;
 
             // 2. mark transitive closure of the roots.
             var v = Visitor{ .heap = self };
@@ -275,6 +325,7 @@ pub fn Heap(comptime Binding: type) type {
             self.bytes_live = 0;
             self.mark_stack.deinit(self.backing);
             self.weak_slots.deinit(self.backing);
+            self.addr_index.deinit(self.backing);
         }
     };
 }
