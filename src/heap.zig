@@ -61,6 +61,13 @@ pub fn Heap(comptime Binding: type) type {
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
         marked_count: usize = 0,
         collections: usize = 0,
+        /// True between `startMarking` and `finishMarking`: an incremental mark
+        /// is in progress and the mutator runs between `markStep`s. While set,
+        /// the insertion `writeBarrier` shades stored-into cells grey, and freshly
+        /// allocated cells are born black (so they survive the in-progress cycle;
+        /// their later-stored children are caught by the barrier). M3 will run
+        /// this phase concurrently with mutators; M2 keeps it under the GIL.
+        marking: bool = false,
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -219,10 +226,17 @@ pub fn Heap(comptime Binding: type) type {
             const total = header_stride + @sizeOf(T);
             const slab = try self.backing.alignedAlloc(u8, .@"16", total);
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
-            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = false };
+            // Allocate-black during an incremental mark: a cell created while
+            // marking is in progress is born marked so it survives this cycle
+            // (it may not be reachable from the already-traced root snapshot).
+            // Its children are added by stores, which the insertion barrier
+            // shades — so a black new cell never hides a white child.
+            const born_marked = self.marking;
+            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = born_marked };
             self.all = h;
             self.live_cells += 1;
             self.bytes_live += total;
+            if (born_marked) self.marked_count += 1;
             return @ptrCast(@alignCast(slab.ptr + header_stride));
         }
 
@@ -232,26 +246,81 @@ pub fn Heap(comptime Binding: type) type {
             if (self.bytes_live >= self.threshold_bytes) self.collect();
         }
 
-        /// A full stop-the-world cycle: mark from roots, clear dead weak edges,
-        /// sweep (finalizing) the white cells.
-        pub fn collect(self: *Self) void {
-            // 1. all cells white.
+        /// Dijkstra insertion write barrier. The embedder calls this whenever it
+        /// stores a reference to `cell` into a heap object during an incremental
+        /// mark: it shades `cell` grey so a reference newly hidden behind an
+        /// already-black object is never missed (the black→white invariant). A
+        /// no-op when not marking, when `cell` is null, or when `cell` is not a
+        /// managed payload (the embedder may store non-cell pointers) — so it is
+        /// cheap and safe to call broadly. Idempotent (already-grey/black: skip).
+        pub fn writeBarrier(self: *Self, cell: ?*anyopaque) void {
+            if (!self.marking) return;
+            const p = cell orelse return;
+            const h = Self.headerOf(p);
+            if (h.magic != header_magic) return;
+            if (h.marked) return;
+            h.marked = true;
+            self.marked_count += 1;
+            self.mark_stack.append(self.backing, h) catch {};
+        }
+
+        /// Begin an incremental mark: whiten all cells and grey the roots. The
+        /// mutator then runs between `markStep`s with the `writeBarrier` active.
+        pub fn startMarking(self: *Self) void {
             var it = self.all;
             while (it) |h| : (it = h.next) h.marked = false;
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             self.weak_slots.clearRetainingCapacity();
-            // The conservative interior-pointer index is rebuilt on demand for
-            // this collection (only if a conservative mark actually occurs).
             self.addr_index_built = false;
-
-            // 2. mark transitive closure of the roots.
+            self.marking = true;
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
+        }
+
+        /// Process up to `budget` grey cells (0 = unbounded). Returns true when
+        /// the mark stack is empty (the grey set is drained for now). Because the
+        /// barrier keeps shading during mutation, "drained" is not final until
+        /// `finishMarking` re-checks under a stop.
+        pub fn markStep(self: *Self, budget: usize) bool {
+            var v = Visitor{ .heap = self };
+            var n: usize = 0;
+            while (self.mark_stack.pop()) |h| {
+                Binding.trace(payloadOf(h), h.kind, &v);
+                n += 1;
+                if (budget != 0 and n >= budget) return self.mark_stack.items.len == 0;
+            }
+            return true;
+        }
+
+        /// Finish an incremental mark (stop-the-world tail): drain any remaining
+        /// grey work the barrier produced, run the ephemeron fixpoint and weak
+        /// processing, then sweep. Roots do not need re-scanning: a cell white at
+        /// `startMarking` was unreachable then and cannot become referenced
+        /// later, while every black→white store during marking was shaded by the
+        /// barrier and new cells were born black.
+        pub fn finishMarking(self: *Self) void {
+            std.debug.assert(self.marking);
+            var v = Visitor{ .heap = self };
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
+            self.marking = false;
+            self.sweepPhase(&v);
+        }
 
+        /// A full stop-the-world cycle: mark from roots, clear dead weak edges,
+        /// sweep (finalizing) the white cells. Equivalent to
+        /// `startMarking` + drain + `finishMarking`, kept as the default.
+        pub fn collect(self: *Self) void {
+            self.startMarking();
+            _ = self.markStep(0); // drain fully
+            self.finishMarking();
+        }
+
+        /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
+        /// stop-the-world and incremental paths. `v` is a live Visitor over self.
+        fn sweepPhase(self: *Self, v: *Visitor) void {
             // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
             // marked key, its value becomes strong. Iterate to a fixed point so
             // values can keep further keys alive through chains of weak maps.
@@ -260,10 +329,10 @@ pub fn Heap(comptime Binding: type) type {
                     const before = self.marked_count;
                     var eit = self.all;
                     while (eit) |h| : (eit = h.next) {
-                        if (h.marked) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, &v);
+                        if (h.marked) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
                     }
                     while (self.mark_stack.pop()) |h| {
-                        Binding.trace(payloadOf(h), h.kind, &v);
+                        Binding.trace(payloadOf(h), h.kind, v);
                     }
                     if (self.marked_count == before) break;
                 }
@@ -574,4 +643,106 @@ test "mark-sweep: ephemeron values stay live only while keys are live" {
     heap.collect();
     try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
+}
+
+test "incremental mark: stepped drain matches stop-the-world reachability" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    // root -> A <-> B (cycle); B -weak-> C; D is unreferenced garbage.
+    const A = try heap.create(N, .node);
+    A.* = .{ .id = 1 };
+    const B = try heap.create(N, .node);
+    B.* = .{ .id = 2 };
+    const C = try heap.create(N, .node);
+    C.* = .{ .id = 3 };
+    const D = try heap.create(N, .node);
+    D.* = .{ .id = 4 };
+    A.strong = B;
+    B.strong = A;
+    B.weak = C;
+    try rt.roots.append(a, A);
+
+    // Drive marking in single-cell steps with no mutation between them: the
+    // result must match `collect()` — A,B kept by the cycle/root; C (weak-only)
+    // and D (garbage) swept.
+    heap.startMarking();
+    var steps: usize = 0;
+    while (!heap.markStep(1)) : (steps += 1) {}
+    heap.finishMarking();
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expect(!heap.marking);
+}
+
+test "incremental mark: insertion barrier saves a cell reparented behind a black object" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const holder = try heap.create(N, .node); // a root → traced black
+    holder.* = .{ .id = 1 };
+    const donor = try heap.create(N, .node); // not a root → would be swept
+    donor.* = .{ .id = 2 };
+    const orphan = try heap.create(N, .node); // reachable only via donor
+    orphan.* = .{ .id = 3 };
+    donor.strong = orphan;
+    try rt.roots.append(a, holder);
+
+    // Snapshot the roots, then fully trace the grey set: `holder` goes black
+    // (strong == null). `donor`/`orphan` stay white (donor isn't a root).
+    heap.startMarking();
+    _ = heap.markStep(0);
+
+    // Mutator hides `orphan` behind the already-black `holder` and drops the
+    // only other path. The store fires the insertion barrier, shading `orphan`.
+    holder.strong = orphan;
+    heap.writeBarrier(orphan);
+    donor.strong = null;
+
+    heap.finishMarking();
+
+    // holder + orphan survive (orphan via the barrier); donor is swept.
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expect(holder.strong == orphan);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]); // donor
+}
+
+test "incremental mark: cells allocated mid-cycle are born black and survive" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const root = try heap.create(N, .node);
+    root.* = .{ .id = 1 };
+    try rt.roots.append(a, root);
+
+    heap.startMarking();
+    _ = heap.markStep(0); // root is black now
+
+    // A cell allocated during marking is born black, so it survives this cycle
+    // even though it is reachable only from a fresh stack local (not re-scanned).
+    const fresh = try heap.create(N, .node);
+    fresh.* = .{ .id = 2 };
+    try std.testing.expect(Heap(TestRT).headerOf(fresh).marked);
+
+    heap.finishMarking();
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells); // root + fresh
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
 }
