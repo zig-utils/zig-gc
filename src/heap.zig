@@ -91,6 +91,16 @@ pub fn Heap(comptime Binding: type) type {
         /// zig). The marker drains it into `mark_stack` between local rounds.
         barrier_buf: std.ArrayListUnmanaged(*Header) = .empty,
         barrier_lock: std.atomic.Value(u32) = .init(0),
+        /// Cells allocated *during* a concurrent mark. They are born marked (so
+        /// the in-progress cycle never sweeps them) but are NOT handed to the
+        /// marker mid-cycle — the mutator is still initializing the payload, so
+        /// tracing it concurrently would read a half-built cell (and race the
+        /// init that overwrites a per-object lock). Instead they accumulate here
+        /// (mutator-private) and are folded into the mark stack at the
+        /// world-stopped `finishConcurrentMark`, where the mutator is quiescent
+        /// and every payload is complete. Uses `aux` (page allocator) so it
+        /// doesn't contend with the marker's `mark_stack` on the cell backing.
+        born_concurrent: std.ArrayListUnmanaged(*Header) = .empty,
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -297,12 +307,13 @@ pub fn Heap(comptime Binding: type) type {
             self.bytes_live += total;
             if (born_grey) {
                 if (self.concurrent) {
-                    // Allocated on the mutator thread during a concurrent mark:
-                    // hand off to the marker (it owns mark_stack); count atomically.
+                    // Allocated on the mutator thread during a concurrent mark.
+                    // Born marked (survives this cycle), but DON'T hand it to the
+                    // marker yet — the caller is still initializing this payload,
+                    // so the marker must not trace it concurrently. Defer it to
+                    // `finishConcurrentMark` (world stopped, payload complete).
                     _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
-                    self.lockBarrier();
-                    self.barrier_buf.append(self.aux, h) catch {};
-                    self.unlockBarrier();
+                    self.born_concurrent.append(self.aux, h) catch {};
                 } else {
                     self.marked_count += 1;
                     self.mark_stack.append(self.aux, h) catch {};
@@ -439,6 +450,7 @@ pub fn Heap(comptime Binding: type) type {
         pub fn beginConcurrentMark(self: *Self) void {
             self.startMarking(); // whiten + trace roots into mark_stack
             self.barrier_buf.clearRetainingCapacity();
+            self.born_concurrent.clearRetainingCapacity();
             self.concurrent = true;
         }
 
@@ -472,6 +484,11 @@ pub fn Heap(comptime Binding: type) type {
             var v = Visitor{ .heap = self };
             self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
             self.barrier_buf.clearRetainingCapacity();
+            // Fold in cells born during the cycle: now world-stopped, their
+            // payloads are complete, so tracing them is safe. They are already
+            // marked; tracing discovers and marks their children.
+            self.mark_stack.appendSlice(self.aux, self.born_concurrent.items) catch {};
+            self.born_concurrent.clearRetainingCapacity();
             Binding.traceRoots(self.ctx, &v); // catch cells moved onto a root mid-mark
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
@@ -558,6 +575,7 @@ pub fn Heap(comptime Binding: type) type {
             self.weak_slots.deinit(self.backing);
             self.addr_index.deinit(self.backing);
             self.barrier_buf.deinit(self.aux);
+            self.born_concurrent.deinit(self.aux);
         }
     };
 }
@@ -1031,4 +1049,73 @@ test "concurrent mark: cells never reparented onto a root are still swept" {
     try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
     try std.testing.expectEqual(@as(u32, 99), rt.finalized.items[0]);
+}
+
+test "concurrent mark: cells allocated mid-cycle are deferred (born_concurrent) and survive" {
+    // The production-driver hazard: the mutator ALLOCATES during the concurrent
+    // window. Born cells must NOT be traced by the marker while the mutator is
+    // still initializing them — they accumulate in `born_concurrent` and are
+    // folded in (and traced) at the world-stopped finish. Here the mutator
+    // creates a chain of fresh nodes under a rooted holder while the marker runs;
+    // all must survive, and a fresh node never linked anywhere also survives this
+    // cycle (born marked).
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const holder = try heap.create(N, .node);
+    holder.* = .{ .id = 0 };
+    try rt.roots.append(a, holder);
+
+    heap.beginConcurrentMark();
+
+    const Shared = struct {
+        heap: *Heap(TestRT),
+        holder: *N,
+        done: std.atomic.Value(bool) = .init(false),
+        fn mutate(s: *@This()) void {
+            // Allocate fresh nodes mid-cycle and chain them under the rooted
+            // holder. `create` defers each to born_concurrent (born marked); the
+            // link store fires the barrier too. A real init writes the payload
+            // right after create — exactly the half-built window the deferral
+            // protects.
+            var prev = s.holder;
+            var i: u32 = 1;
+            while (i <= 1000) : (i += 1) {
+                const node = s.heap.create(N, .node) catch return;
+                node.* = .{ .id = i };
+                @atomicStore(?*N, &prev.strong, node, .monotonic);
+                s.heap.writeBarrier(node);
+                prev = node;
+            }
+            s.done.store(true, .release);
+        }
+        fn markLoop(s: *@This()) void {
+            while (true) {
+                const q = s.heap.concurrentMarkRound();
+                if (s.done.load(.acquire) and q) break;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var shared = Shared{ .heap = &heap, .holder = holder };
+    const mut = try std.Thread.spawn(.{}, Shared.mutate, .{&shared});
+    const mk = try std.Thread.spawn(.{}, Shared.markLoop, .{&shared});
+    mut.join();
+    mk.join();
+    heap.finishConcurrentMark();
+
+    // holder + 1000 fresh nodes all survive.
+    try std.testing.expectEqual(@as(usize, 1001), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    var cur: ?*N = holder.strong;
+    var count: usize = 0;
+    while (cur) |c| : (cur = c.strong) count += 1;
+    try std.testing.expectEqual(@as(usize, 1000), count);
 }
