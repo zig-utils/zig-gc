@@ -66,9 +66,21 @@ pub fn Heap(comptime Binding: type) type {
         /// the insertion `writeBarrier` shades stored-into cells grey, and freshly
         /// allocated cells are born grey (so they survive the in-progress cycle
         /// and their creation-time field writes are caught when traced; later
-        /// stores are caught by the barrier). M3 will run this phase concurrently
-        /// with mutators; M2 keeps it under the GIL.
+        /// stores are caught by the barrier). M3 runs this phase concurrently
+        /// with mutators (`concurrent`); M2 keeps it under the GIL.
         marking: bool = false,
+        /// True during a *concurrent* mark (M3): the marker runs on its own
+        /// thread while mutators keep executing. The mark-claim then uses an
+        /// atomic compare-and-set on the cell's mark bit (so marker and mutator
+        /// never double-push), and the mutator's `writeBarrier` hands greyed
+        /// cells to the marker through the lock-guarded `barrier_buf` instead of
+        /// touching the marker-private `mark_stack`.
+        concurrent: bool = false,
+        /// Mutator→marker hand-off buffer for concurrent marking, guarded by
+        /// `barrier_lock` (a brief atomic spinlock; no std.Thread.Mutex in this
+        /// zig). The marker drains it into `mark_stack` between local rounds.
+        barrier_buf: std.ArrayListUnmanaged(*Header) = .empty,
+        barrier_lock: std.atomic.Value(u32) = .init(0),
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -88,14 +100,14 @@ pub fn Heap(comptime Binding: type) type {
             oom: bool = false,
 
             /// Mark a strong reference. Null-safe and idempotent (tri-color:
-            /// white→grey on first sight, pushed once).
+            /// white→grey on first sight, pushed once). The white→grey claim is
+            /// atomic under a concurrent mark so the marker and a mutator's
+            /// `writeBarrier` never both push the same cell.
             pub fn mark(v: *Visitor, cell: ?*anyopaque) void {
                 const p = cell orelse return;
                 const h = Self.headerOf(p);
                 if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
-                if (h.marked) return;
-                h.marked = true;
-                v.heap.marked_count += 1;
+                if (!v.heap.claimMark(h)) return; // already grey/black
                 v.heap.mark_stack.append(v.heap.backing, h) catch {
                     v.oom = true;
                 };
@@ -241,8 +253,17 @@ pub fn Heap(comptime Binding: type) type {
             self.live_cells += 1;
             self.bytes_live += total;
             if (born_grey) {
-                self.marked_count += 1;
-                self.mark_stack.append(self.backing, h) catch {};
+                if (self.concurrent) {
+                    // Allocated on the mutator thread during a concurrent mark:
+                    // hand off to the marker (it owns mark_stack); count atomically.
+                    _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
+                    self.lockBarrier();
+                    self.barrier_buf.append(self.backing, h) catch {};
+                    self.unlockBarrier();
+                } else {
+                    self.marked_count += 1;
+                    self.mark_stack.append(self.backing, h) catch {};
+                }
             }
             return @ptrCast(@alignCast(slab.ptr + header_stride));
         }
@@ -265,10 +286,38 @@ pub fn Heap(comptime Binding: type) type {
             const p = cell orelse return;
             const h = Self.headerOf(p);
             if (h.magic != header_magic) return;
-            if (h.marked) return;
+            if (!self.claimMark(h)) return;
+            if (self.concurrent) {
+                // Hand the greyed cell to the marker thread (it owns mark_stack).
+                self.lockBarrier();
+                self.barrier_buf.append(self.backing, h) catch {};
+                self.unlockBarrier();
+            } else {
+                self.mark_stack.append(self.backing, h) catch {};
+            }
+        }
+
+        /// Atomically claim a white cell as grey (returns true once per cell).
+        /// Under a concurrent mark the claim is a compare-and-set so the marker
+        /// and a mutator's `writeBarrier` never both push the same cell; the
+        /// single-threaded path is a plain check.
+        fn claimMark(self: *Self, h: *Header) bool {
+            if (self.concurrent) {
+                if (@cmpxchgStrong(bool, &h.marked, false, true, .acq_rel, .monotonic) != null) return false;
+                _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
+                return true;
+            }
+            if (h.marked) return false;
             h.marked = true;
             self.marked_count += 1;
-            self.mark_stack.append(self.backing, h) catch {};
+            return true;
+        }
+
+        inline fn lockBarrier(self: *Self) void {
+            while (self.barrier_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        }
+        inline fn unlockBarrier(self: *Self) void {
+            self.barrier_lock.store(0, .release);
         }
 
         /// Begin an incremental mark: whiten all cells and grey the roots. The
@@ -327,6 +376,65 @@ pub fn Heap(comptime Binding: type) type {
             self.startMarking();
             _ = self.markStep(0); // drain fully
             self.finishMarking();
+        }
+
+        // ---- Concurrent marking (M3) -------------------------------------
+        //
+        // The marker runs on its own thread while mutators keep executing. The
+        // mutator publishes greyed cells (insertion barrier + born-grey allocs)
+        // into `barrier_buf`; the marker drains its private `mark_stack` and
+        // folds in `barrier_buf` each round. White→grey claims are atomic
+        // (`claimMark`), so no cell is double-pushed. Roots are traced at
+        // `beginConcurrentMark` while the world is stopped, and re-scanned at
+        // `finishConcurrentMark` (also stopped) to catch cells the mutator moved
+        // onto a root mid-mark. This is the "make the collector concurrent" step
+        // of M3 (docs/threads/P7-gc-design.md); dropping the GIL is the rest.
+
+        /// Begin a concurrent mark. Call with the world stopped (no mutator
+        /// running): whitens all cells and greys the roots into `mark_stack`,
+        /// then flips `concurrent` on so mutators route through `barrier_buf`.
+        pub fn beginConcurrentMark(self: *Self) void {
+            self.startMarking(); // whiten + trace roots into mark_stack
+            self.barrier_buf.clearRetainingCapacity();
+            self.concurrent = true;
+        }
+
+        /// One marker-thread round: trace everything currently grey, then fold
+        /// in whatever the mutator handed off. Returns true when both the local
+        /// stack and the hand-off buffer were empty this round (a quiescent
+        /// point — not final until the world is stopped for `finishConcurrentMark`).
+        pub fn concurrentMarkRound(self: *Self) bool {
+            var v = Visitor{ .heap = self };
+            while (self.mark_stack.pop()) |h| {
+                Binding.trace(payloadOf(h), h.kind, &v);
+            }
+            self.lockBarrier();
+            const handed = self.barrier_buf.items.len;
+            if (handed > 0) {
+                self.mark_stack.appendSlice(self.backing, self.barrier_buf.items) catch {
+                    v.oom = true;
+                };
+                self.barrier_buf.clearRetainingCapacity();
+            }
+            self.unlockBarrier();
+            return handed == 0 and self.mark_stack.items.len == 0;
+        }
+
+        /// Finish a concurrent mark (call with the world stopped): fold in any
+        /// remaining hand-off, re-scan roots, drain, run the ephemeron/weak pass,
+        /// and sweep. After this `concurrent`/`marking` are off.
+        pub fn finishConcurrentMark(self: *Self) void {
+            std.debug.assert(self.marking and self.concurrent);
+            self.concurrent = false; // world is stopped; claims need not be atomic now
+            var v = Visitor{ .heap = self };
+            self.mark_stack.appendSlice(self.backing, self.barrier_buf.items) catch {};
+            self.barrier_buf.clearRetainingCapacity();
+            Binding.traceRoots(self.ctx, &v); // catch cells moved onto a root mid-mark
+            while (self.mark_stack.pop()) |h| {
+                Binding.trace(payloadOf(h), h.kind, &v);
+            }
+            self.marking = false;
+            self.sweepPhase(&v);
         }
 
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
@@ -406,6 +514,7 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.deinit(self.backing);
             self.weak_slots.deinit(self.backing);
             self.addr_index.deinit(self.backing);
+            self.barrier_buf.deinit(self.backing);
         }
     };
 }
@@ -756,4 +865,111 @@ test "incremental mark: cells allocated mid-cycle are born grey and survive" {
     heap.finishMarking();
     try std.testing.expectEqual(@as(usize, 2), heap.live_cells); // root + fresh
     try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+}
+
+test "concurrent mark: a mutator racing the marker behind the barrier loses no live cell" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    // A rooted `holder`, plus a pool of initially-unreferenced nodes that the
+    // mutator will reparent under `holder` *during* the concurrent mark — the
+    // classic concurrent hazard (a white cell hidden behind a black root).
+    const holder = try heap.create(N, .node);
+    holder.* = .{ .id = 0 };
+    try rt.roots.append(a, holder);
+
+    const pool_n = 2000;
+    var pool: [pool_n]*N = undefined;
+    for (&pool, 0..) |*slot, i| {
+        const node = try heap.create(N, .node);
+        node.* = .{ .id = @intCast(i + 1) };
+        slot.* = node;
+    }
+
+    // Begin the concurrent mark with the world stopped (only `holder` is rooted;
+    // the pool is all white).
+    heap.beginConcurrentMark();
+
+    const Shared = struct {
+        heap: *Heap(TestRT),
+        holder: *N,
+        pool: []*N,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn mutate(s: *@This()) void {
+            // Chain each pool node under holder and fire the insertion barrier —
+            // exactly what the engine's store funnels do. The marker is running
+            // concurrently; without the barrier these would be swept.
+            var prev = s.holder;
+            for (s.pool) |node| {
+                prev.strong = node;
+                s.heap.writeBarrier(node);
+                prev = node;
+            }
+            s.done.store(true, .release);
+        }
+        fn markLoop(s: *@This()) void {
+            // Drain rounds until the mutator is done and a final round is clean.
+            while (true) {
+                const quiescent = s.heap.concurrentMarkRound();
+                if (s.done.load(.acquire) and quiescent) break;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    var shared = Shared{ .heap = &heap, .holder = holder, .pool = pool[0..] };
+
+    const mut = try std.Thread.spawn(.{}, Shared.mutate, .{&shared});
+    const mk = try std.Thread.spawn(.{}, Shared.markLoop, .{&shared});
+    mut.join();
+    mk.join();
+
+    // World stopped again: finish + sweep.
+    heap.finishConcurrentMark();
+
+    // Every pool node is now reachable holder→n1→n2→…; none must have been
+    // swept, and nothing should have been finalized.
+    try std.testing.expectEqual(@as(usize, pool_n + 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    // Spot-check the chain is intact.
+    var cur: ?*N = holder.strong;
+    var count: usize = 0;
+    while (cur) |c| : (cur = c.strong) count += 1;
+    try std.testing.expectEqual(@as(usize, pool_n), count);
+}
+
+test "concurrent mark: cells never reparented onto a root are still swept" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const root = try heap.create(N, .node);
+    root.* = .{ .id = 0 };
+    try rt.roots.append(a, root);
+    // A garbage node that the mutator touches but never links to a root.
+    const garbage = try heap.create(N, .node);
+    garbage.* = .{ .id = 99 };
+
+    heap.beginConcurrentMark();
+    _ = heap.concurrentMarkRound(); // marker drains the rooted graph
+    // Mutator writes garbage's own field (no barrier needed for self) — it stays
+    // unreachable from any root.
+    garbage.strong = null;
+    heap.finishConcurrentMark();
+
+    // root survives; garbage is collected.
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 99), rt.finalized.items[0]);
 }
