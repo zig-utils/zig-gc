@@ -49,6 +49,16 @@ pub fn Heap(comptime Binding: type) type {
         const header_stride = std.mem.alignForward(usize, @sizeOf(Header), 16);
 
         backing: std.mem.Allocator,
+        /// Scratch allocator for the collector's own bookkeeping that the marker
+        /// thread and a mutator both touch during a *concurrent* mark — the
+        /// `mark_stack` (grown by the marker) and `barrier_buf` (grown by the
+        /// mutator's barrier/born-grey path). Defaults to `backing`, so M1/M2 are
+        /// byte-identical; for concurrent marking (M3) the embedder installs a
+        /// thread-safe allocator via `setAuxAllocator` so these two threads don't
+        /// race on a shared non-thread-safe allocator. Cell slabs stay on
+        /// `backing`, which only the (GIL-serialized) mutator allocates from
+        /// while the marker runs, so it needs no such guarantee.
+        aux: std.mem.Allocator = undefined,
         ctx: *Binding,
         /// Intrusive singly-linked list of every live cell (sweep walks it).
         all: ?*Header = null,
@@ -108,7 +118,7 @@ pub fn Heap(comptime Binding: type) type {
                 const h = Self.headerOf(p);
                 if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
                 if (!v.heap.claimMark(h)) return; // already grey/black
-                v.heap.mark_stack.append(v.heap.backing, h) catch {
+                v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
                 };
             }
@@ -140,7 +150,7 @@ pub fn Heap(comptime Binding: type) type {
                 if (h.marked) return;
                 h.marked = true;
                 v.heap.marked_count += 1;
-                v.heap.mark_stack.append(v.heap.backing, h) catch {
+                v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
                 };
             }
@@ -175,7 +185,15 @@ pub fn Heap(comptime Binding: type) type {
         };
 
         pub fn init(backing: std.mem.Allocator, ctx: *Binding) Self {
-            return .{ .backing = backing, .ctx = ctx };
+            return .{ .backing = backing, .aux = backing, .ctx = ctx };
+        }
+
+        /// Install a thread-safe scratch allocator for concurrent marking (M3).
+        /// Must be called right after `init`, before any allocation, since
+        /// `mark_stack`/`barrier_buf` must be freed with the same allocator they
+        /// were grown with. A no-op conceptually for M1/M2 (leave it as `backing`).
+        pub fn setAuxAllocator(self: *Self, aux: std.mem.Allocator) void {
+            self.aux = aux;
         }
 
         fn headerOf(payload: *anyopaque) *Header {
@@ -270,11 +288,11 @@ pub fn Heap(comptime Binding: type) type {
                     // hand off to the marker (it owns mark_stack); count atomically.
                     _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
                     self.lockBarrier();
-                    self.barrier_buf.append(self.backing, h) catch {};
+                    self.barrier_buf.append(self.aux, h) catch {};
                     self.unlockBarrier();
                 } else {
                     self.marked_count += 1;
-                    self.mark_stack.append(self.backing, h) catch {};
+                    self.mark_stack.append(self.aux, h) catch {};
                 }
             }
             return @ptrCast(@alignCast(slab.ptr + header_stride));
@@ -302,10 +320,10 @@ pub fn Heap(comptime Binding: type) type {
             if (self.concurrent) {
                 // Hand the greyed cell to the marker thread (it owns mark_stack).
                 self.lockBarrier();
-                self.barrier_buf.append(self.backing, h) catch {};
+                self.barrier_buf.append(self.aux, h) catch {};
                 self.unlockBarrier();
             } else {
-                self.mark_stack.append(self.backing, h) catch {};
+                self.mark_stack.append(self.aux, h) catch {};
             }
         }
 
@@ -423,7 +441,7 @@ pub fn Heap(comptime Binding: type) type {
             self.lockBarrier();
             const handed = self.barrier_buf.items.len;
             if (handed > 0) {
-                self.mark_stack.appendSlice(self.backing, self.barrier_buf.items) catch {
+                self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {
                     v.oom = true;
                 };
                 self.barrier_buf.clearRetainingCapacity();
@@ -439,7 +457,7 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(self.marking and self.concurrent);
             self.concurrent = false; // world is stopped; claims need not be atomic now
             var v = Visitor{ .heap = self };
-            self.mark_stack.appendSlice(self.backing, self.barrier_buf.items) catch {};
+            self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
             self.barrier_buf.clearRetainingCapacity();
             Binding.traceRoots(self.ctx, &v); // catch cells moved onto a root mid-mark
             while (self.mark_stack.pop()) |h| {
@@ -523,10 +541,10 @@ pub fn Heap(comptime Binding: type) type {
             self.all = null;
             self.live_cells = 0;
             self.bytes_live = 0;
-            self.mark_stack.deinit(self.backing);
+            self.mark_stack.deinit(self.aux);
             self.weak_slots.deinit(self.backing);
             self.addr_index.deinit(self.backing);
-            self.barrier_buf.deinit(self.backing);
+            self.barrier_buf.deinit(self.aux);
         }
     };
 }
@@ -558,7 +576,15 @@ const TestRT = struct {
         switch (kind) {
             .node => {
                 const n: *Node = @ptrCast(@alignCast(cell));
-                v.mark(n.strong);
+                // Under a concurrent mark the mutator may store into `strong`
+                // while we read it (it then fires the barrier, so the new target
+                // is marked regardless). A bare reference slot the marker reads
+                // and a mutator writes must be accessed atomically to be
+                // race-free per the memory model — a relaxed load/store, which is
+                // a plain mov on x86_64/arm64. This is the pattern the engine
+                // binding uses for its non-collection pointer slots (e.g. proto).
+                const s = if (v.concurrent()) @atomicLoad(?*Node, &n.strong, .monotonic) else n.strong;
+                v.mark(s);
                 v.markWeak(&n.weak);
             },
         }
@@ -886,6 +912,10 @@ test "concurrent mark: a mutator racing the marker behind the barrier loses no l
     defer rt.finalized.deinit(a);
 
     var heap = Heap(TestRT).init(a, &rt);
+    // Concurrent marking: marker (mark_stack) and mutator (barrier_buf) grow GC
+    // scratch from `aux` on different threads, so it must be thread-safe — the
+    // page allocator is. Cell slabs stay on the (single-threaded here) backing.
+    heap.setAuxAllocator(std.heap.page_allocator);
     defer heap.deinit();
 
     const N = TestRT.Node;
@@ -920,7 +950,10 @@ test "concurrent mark: a mutator racing the marker behind the barrier loses no l
             // concurrently; without the barrier these would be swept.
             var prev = s.holder;
             for (s.pool) |node| {
-                prev.strong = node;
+                // Atomic store pairs with the marker's atomic load of `strong`
+                // (relaxed: ordering of the new edge is established by the
+                // barrier, not this store), then shade the new target grey.
+                @atomicStore(?*N, &prev.strong, node, .monotonic);
                 s.heap.writeBarrier(node);
                 prev = node;
             }
@@ -963,6 +996,7 @@ test "concurrent mark: cells never reparented onto a root are still swept" {
     defer rt.finalized.deinit(a);
 
     var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator); // thread-safe GC scratch (see above)
     defer heap.deinit();
 
     const N = TestRT.Node;
