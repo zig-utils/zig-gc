@@ -153,6 +153,18 @@ pub fn Heap(comptime Binding: type) type {
                 while (i < words) : (i += 1) v.markConservativeWord(start[i]);
             }
 
+            /// Whether this trace is running on the marker thread *concurrently*
+            /// with live mutators (M3). Bindings whose cells have internally
+            /// mutable storage (a growable slot/element vector behind a lock)
+            /// must, when this is true, read that storage under the same lock the
+            /// mutator takes — otherwise the marker's read races a mutator's
+            /// append/realloc. False under stop-the-world (M1) and GIL-held
+            /// incremental (M2) marking, where the world is quiescent during the
+            /// read, so the binding can skip the lock on those paths.
+            pub fn concurrent(v: *Visitor) bool {
+                return v.heap.concurrent;
+            }
+
             /// Register a weak slot. After marking completes, if its target
             /// stayed white the slot is set to null (the cell is dying).
             pub fn markWeak(v: *Visitor, slot: *?*anyopaque) void {
