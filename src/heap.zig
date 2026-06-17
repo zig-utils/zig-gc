@@ -135,10 +135,18 @@ pub fn Heap(comptime Binding: type) type {
 
             /// Whether `cell` is one of this heap's managed payloads. Bindings use
             /// this before marking legacy/embedder pointers that may still point
-            /// outside the GC heap.
+            /// outside the GC heap. O(1): reads the candidate header's magic
+            /// (exactly the check `mark` makes), so it does **not** walk the
+            /// all-cells list — which would both cost O(n) per call and race the
+            /// mutator's `create` prepending to that list during a concurrent
+            /// mark. Callers must only pass pointers into mapped memory (a GC cell
+            /// or another live engine allocation, e.g. an arena cell), never a
+            /// freed or wild pointer; arena bytes simply won't match the magic.
             pub fn isManaged(v: *Visitor, cell: ?*anyopaque) bool {
+                _ = v;
                 const p = cell orelse return false;
-                return v.heap.headerForPayload(p) != null;
+                if (!std.mem.isAligned(@intFromPtr(p), 16)) return false;
+                return Self.headerOf(p).magic == header_magic;
             }
 
             /// Whether a cell is already black/grey in the current collection.
