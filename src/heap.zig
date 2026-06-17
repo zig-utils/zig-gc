@@ -64,9 +64,10 @@ pub fn Heap(comptime Binding: type) type {
         /// True between `startMarking` and `finishMarking`: an incremental mark
         /// is in progress and the mutator runs between `markStep`s. While set,
         /// the insertion `writeBarrier` shades stored-into cells grey, and freshly
-        /// allocated cells are born black (so they survive the in-progress cycle;
-        /// their later-stored children are caught by the barrier). M3 will run
-        /// this phase concurrently with mutators; M2 keeps it under the GIL.
+        /// allocated cells are born grey (so they survive the in-progress cycle
+        /// and their creation-time field writes are caught when traced; later
+        /// stores are caught by the barrier). M3 will run this phase concurrently
+        /// with mutators; M2 keeps it under the GIL.
         marking: bool = false,
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
@@ -226,17 +227,23 @@ pub fn Heap(comptime Binding: type) type {
             const total = header_stride + @sizeOf(T);
             const slab = try self.backing.alignedAlloc(u8, .@"16", total);
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
-            // Allocate-black during an incremental mark: a cell created while
-            // marking is in progress is born marked so it survives this cycle
-            // (it may not be reachable from the already-traced root snapshot).
-            // Its children are added by stores, which the insertion barrier
-            // shades — so a black new cell never hides a white child.
-            const born_marked = self.marking;
-            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = born_marked };
+            // Allocate-grey during an incremental mark: a cell created while
+            // marking is in progress is born marked AND queued for tracing, so it
+            // survives this cycle and — crucially — its *creation-time* field
+            // writes are caught when it is traced (the caller fully initializes
+            // the payload before the next safepoint, where the next `markStep`
+            // runs). This is what lets the embedder barrier only post-creation
+            // mutations instead of every initializing store. Children added after
+            // it is traced are caught by the insertion `writeBarrier`.
+            const born_grey = self.marking;
+            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = born_grey };
             self.all = h;
             self.live_cells += 1;
             self.bytes_live += total;
-            if (born_marked) self.marked_count += 1;
+            if (born_grey) {
+                self.marked_count += 1;
+                self.mark_stack.append(self.backing, h) catch {};
+            }
             return @ptrCast(@alignCast(slab.ptr + header_stride));
         }
 
@@ -293,15 +300,19 @@ pub fn Heap(comptime Binding: type) type {
             return true;
         }
 
-        /// Finish an incremental mark (stop-the-world tail): drain any remaining
-        /// grey work the barrier produced, run the ephemeron fixpoint and weak
-        /// processing, then sweep. Roots do not need re-scanning: a cell white at
-        /// `startMarking` was unreachable then and cannot become referenced
-        /// later, while every black→white store during marking was shaded by the
-        /// barrier and new cells were born black.
+        /// Finish an incremental mark (stop-the-world tail): re-scan the roots,
+        /// drain the grey set, run the ephemeron fixpoint and weak processing,
+        /// then sweep. The root re-scan closes the one gap the heap-store
+        /// insertion barrier doesn't: a reachable-but-white cell the mutator
+        /// moved onto a *root* (an operand stack, a native frame, the microtask
+        /// queue) after `startMarking` snapshotted them. Heap→heap moves are
+        /// covered by the barrier; root moves are covered here. (For a
+        /// stop-the-world `collect()` no mutation happened, so this re-scan only
+        /// re-touches already-marked roots — cheap and harmless.)
         pub fn finishMarking(self: *Self) void {
             std.debug.assert(self.marking);
             var v = Visitor{ .heap = self };
+            Binding.traceRoots(self.ctx, &v);
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
@@ -719,7 +730,7 @@ test "incremental mark: insertion barrier saves a cell reparented behind a black
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]); // donor
 }
 
-test "incremental mark: cells allocated mid-cycle are born black and survive" {
+test "incremental mark: cells allocated mid-cycle are born grey and survive" {
     const a = std.testing.allocator;
     var rt = TestRT{};
     defer rt.roots.deinit(a);
@@ -736,8 +747,8 @@ test "incremental mark: cells allocated mid-cycle are born black and survive" {
     heap.startMarking();
     _ = heap.markStep(0); // root is black now
 
-    // A cell allocated during marking is born black, so it survives this cycle
-    // even though it is reachable only from a fresh stack local (not re-scanned).
+    // A cell allocated during marking is born grey (marked + queued), so it
+    // survives this cycle and its creation-time fields would be traced.
     const fresh = try heap.create(N, .node);
     fresh.* = .{ .id = 2 };
     try std.testing.expect(Heap(TestRT).headerOf(fresh).marked);
