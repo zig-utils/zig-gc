@@ -214,6 +214,19 @@ pub fn Heap(comptime Binding: type) type {
             return null;
         }
 
+        /// Whether `p` is a live (marked) cell — O(1). `p` must be null or a
+        /// pointer to a cell allocated by this heap. This is the read a binding
+        /// uses for **isMarked-based weak clearing**: deciding a weak key's /
+        /// finalizer target's liveness in the world-stopped finish pass by its
+        /// mark bit, instead of pre-registering an interior `&slot` weak pointer
+        /// that a concurrent mutator append could dangle by reallocating the
+        /// buffer it points into. Call only with marks still valid (before sweep).
+        pub fn isLive(self: *Self, p: ?*anyopaque) bool {
+            _ = self;
+            const ptr = p orelse return false;
+            return headerOf(ptr).marked;
+        }
+
         fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
             // Lazily build the address-sorted index on first use within a
             // collection (reset by `collect`). The mark phase never allocates or
