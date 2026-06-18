@@ -108,6 +108,14 @@ pub fn Heap(comptime Binding: type) type {
         /// finish. Marker-thread-private during rounds; drained at finish after
         /// the marker has joined. Uses `aux`.
         deferred_trace: std.ArrayListUnmanaged(*Header) = .empty,
+        /// True when *multiple* mutators allocate concurrently (the post-GIL
+        /// model). Then `create`'s shared-state bookkeeping — the `all`-list
+        /// prepend, the live/bytes counters, and the born-cell hand-off — runs
+        /// under `alloc_lock`, and `backing` must itself be thread-safe. Off (the
+        /// default, and today's single-GIL'd-mutator model) → that bookkeeping is
+        /// lock-free, so single-threaded allocation pays nothing.
+        parallel: bool = false,
+        alloc_lock: std.atomic.Value(u32) = .init(0),
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -236,6 +244,14 @@ pub fn Heap(comptime Binding: type) type {
             self.aux = aux;
         }
 
+        /// Enable multi-mutator allocation (the post-GIL model): `create`'s
+        /// shared-state bookkeeping runs under `alloc_lock`. `backing` must be
+        /// thread-safe. Leave off (default) for the single-GIL'd-mutator model so
+        /// allocation pays no lock.
+        pub fn setParallel(self: *Self, parallel: bool) void {
+            self.parallel = parallel;
+        }
+
         fn headerOf(payload: *anyopaque) *Header {
             const raw: [*]u8 = @ptrCast(payload);
             return @ptrCast(@alignCast(raw - header_stride));
@@ -320,8 +336,15 @@ pub fn Heap(comptime Binding: type) type {
         pub fn create(self: *Self, comptime T: type, kind: Kind) !*T {
             comptime std.debug.assert(@alignOf(T) <= 16);
             const total = header_stride + @sizeOf(T);
+            // The slab alloc happens before the lock: `backing` is thread-safe in
+            // `parallel` mode, and `h` is private until linked into `all` below.
             const slab = try self.backing.alignedAlloc(u8, .@"16", total);
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
+            // Shared-state bookkeeping (all-list prepend, counters, born-cell
+            // hand-off) is serialized across mutators in `parallel` mode; lock-free
+            // otherwise (single GIL'd mutator).
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
             // Allocate-grey during an incremental mark: a cell created while
             // marking is in progress is born marked AND queued for tracing, so it
             // survives this cycle and — crucially — its *creation-time* field
@@ -402,6 +425,13 @@ pub fn Heap(comptime Binding: type) type {
         }
         inline fn unlockBarrier(self: *Self) void {
             self.barrier_lock.store(0, .release);
+        }
+
+        inline fn lockAlloc(self: *Self) void {
+            while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        }
+        inline fn unlockAlloc(self: *Self) void {
+            self.alloc_lock.store(0, .release);
         }
 
         /// Begin an incremental mark: whiten all cells and grey the roots. The
@@ -1155,4 +1185,50 @@ test "concurrent mark: cells allocated mid-cycle are deferred (born_concurrent) 
     var count: usize = 0;
     while (cur) |c| : (cur = c.strong) count += 1;
     try std.testing.expectEqual(@as(usize, 1000), count);
+}
+
+test "parallel: multiple mutators allocate concurrently without corrupting the heap" {
+    // The first GIL-removal prerequisite: cell allocation must be thread-safe so
+    // several mutators can `create` at once. With `setParallel`, the all-list
+    // prepend + counters run under `alloc_lock` and `backing` is the thread-safe
+    // page allocator. N threads each allocate M cells; afterward the heap must
+    // hold exactly N*M cells (no lost/double-linked nodes), every cell's header
+    // magic intact, and the `all` list length must match the counter.
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    heap.backing = std.heap.page_allocator; // thread-safe cell slabs for parallel alloc
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const threads = 8;
+    const per = 2000;
+    const Worker = struct {
+        heap: *Heap(TestRT),
+        fn run(s: *@This()) void {
+            var i: usize = 0;
+            while (i < per) : (i += 1) {
+                const node = s.heap.create(N, .node) catch return;
+                node.* = .{ .id = @intCast(i) }; // fully initialize (no marker running)
+            }
+        }
+    };
+    var w = Worker{ .heap = &heap };
+    var pool: [threads]std.Thread = undefined;
+    for (&pool) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{&w});
+    for (&pool) |*t| t.join();
+
+    // Exactly N*M live cells, and the all-list length agrees with the counter —
+    // a lost/double-linked prepend or a torn counter (the race a non-thread-safe
+    // create would cause) would make these mismatch.
+    try std.testing.expectEqual(@as(usize, threads * per), heap.live_cells);
+    var walked: usize = 0;
+    var it = heap.all;
+    while (it) |hdr| : (it = hdr.next) walked += 1;
+    try std.testing.expectEqual(@as(usize, threads * per), walked);
 }
