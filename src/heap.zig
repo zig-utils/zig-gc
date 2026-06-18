@@ -101,6 +101,13 @@ pub fn Heap(comptime Binding: type) type {
         /// and every payload is complete. Uses `aux` (page allocator) so it
         /// doesn't contend with the marker's `mark_stack` on the cell backing.
         born_concurrent: std.ArrayListUnmanaged(*Header) = .empty,
+        /// Cells the marker chose to *trace* at the world-stopped finish rather
+        /// than mid-cycle (via `Visitor.deferToFinish`) — those whose mutable
+        /// storage can't be read safely while the mutator runs. They are already
+        /// marked (won't be swept); only their outgoing edges are discovered at
+        /// finish. Marker-thread-private during rounds; drained at finish after
+        /// the marker has joined. Uses `aux`.
+        deferred_trace: std.ArrayListUnmanaged(*Header) = .empty,
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -191,6 +198,21 @@ pub fn Heap(comptime Binding: type) type {
             /// read, so the binding can skip the lock on those paths.
             pub fn concurrent(v: *Visitor) bool {
                 return v.heap.concurrent;
+            }
+
+            /// Defer this (already-marked) cell's *tracing* to the world-stopped
+            /// `finishConcurrentMark`. For cells whose mutable storage is too
+            /// entangled to read safely mid-mark (e.g. a generator whose `exec`
+            /// is the live VM stack, or an iterator helper whose fields update
+            /// around JS callbacks): the binding calls this from `trace` when
+            /// `concurrent()`, so the cell survives this cycle (it is marked) but
+            /// its children are discovered at finish, when the mutator is
+            /// quiescent and the storage is stable. A no-op outside a concurrent
+            /// mark (the caller should just trace normally then).
+            pub fn deferToFinish(v: *Visitor, cell: *anyopaque) void {
+                v.heap.deferred_trace.append(v.heap.aux, Self.headerOf(cell)) catch {
+                    v.oom = true;
+                };
             }
 
             /// Register a weak slot. After marking completes, if its target
@@ -459,6 +481,7 @@ pub fn Heap(comptime Binding: type) type {
             self.startMarking(); // whiten + trace roots into mark_stack
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
+            self.deferred_trace.clearRetainingCapacity();
             self.concurrent = true;
         }
 
@@ -497,6 +520,11 @@ pub fn Heap(comptime Binding: type) type {
             // marked; tracing discovers and marks their children.
             self.mark_stack.appendSlice(self.aux, self.born_concurrent.items) catch {};
             self.born_concurrent.clearRetainingCapacity();
+            // Cells whose tracing was deferred (mutable storage unsafe to read
+            // mid-mark) are traced now — world stopped, storage stable. They are
+            // already marked; trace discovers their (possibly white) children.
+            for (self.deferred_trace.items) |h| Binding.trace(payloadOf(h), h.kind, &v);
+            self.deferred_trace.clearRetainingCapacity();
             Binding.traceRoots(self.ctx, &v); // catch cells moved onto a root mid-mark
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
@@ -584,6 +612,7 @@ pub fn Heap(comptime Binding: type) type {
             self.addr_index.deinit(self.backing);
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
+            self.deferred_trace.deinit(self.aux);
         }
     };
 }
