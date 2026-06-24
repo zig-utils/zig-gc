@@ -10,12 +10,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // ThreadSanitizer gate for the concurrent/parallel collector (issue #1 M3).
+    // TSan can't build on the macOS dev box (bundled libcxx), so this runs on
+    // Linux CI: `zig build test -Dtsan=true`.
+    const tsan = b.option(bool, "tsan", "Build the tests with ThreadSanitizer") orelse false;
+
     // Unit tests over the collector core.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = tsan,
         }),
     });
     const run_tests = b.addRunArtifact(tests);

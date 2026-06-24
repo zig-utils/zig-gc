@@ -1,0 +1,45 @@
+name: CI
+
+# zig-gc is a self-contained mark-sweep collector (no sibling deps). The
+# ThreadSanitizer job is the gate for the concurrent/parallel collector
+# (issue #1 Phase 7 / M3) — it cannot build on the macOS dev box (the bundled
+# libcxx fails the TSan runtime compile), so race detection for the parallel
+# mark+sweep runs here on Linux.
+on:
+  push:
+    branches: [main, p7-parallel-marker]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.131+73c51c142
+      - name: unit tests
+        run: zig build test
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.131+73c51c142
+      - name: ThreadSanitizer (loop the parallel collector to surface races)
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          # The parallel concurrent collector test is multi-threaded; loop the
+          # instrumented suite so a rare publish/ack/sweep ordering race shows.
+          for i in $(seq 1 20); do
+            echo "=== zig-gc TSan iter $i ==="
+            zig build test -Dtsan=true
+          done
+          echo "no TSan race in 20 iterations"
