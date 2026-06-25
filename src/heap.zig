@@ -78,14 +78,20 @@ pub fn Heap(comptime Binding: type) type {
         /// and their creation-time field writes are caught when traced; later
         /// stores are caught by the barrier). M3 runs this phase concurrently
         /// with mutators (`concurrent`); M2 keeps it under the GIL.
-        marking: bool = false,
+        ///
+        /// Atomic because the *parallel* M3 model toggles it on the collector
+        /// while peer mutators read it on their `create` / `writeBarrier` hot
+        /// paths with no GIL. The load is `.acquire` / store `.release`, which
+        /// on x86_64/arm64 is a plain `mov` — the M1/M2 fast path is unchanged.
+        marking: std.atomic.Value(bool) = .init(false),
         /// True during a *concurrent* mark (M3): the marker runs on its own
         /// thread while mutators keep executing. The mark-claim then uses an
         /// atomic compare-and-set on the cell's mark bit (so marker and mutator
         /// never double-push), and the mutator's `writeBarrier` hands greyed
         /// cells to the marker through the lock-guarded `barrier_buf` instead of
-        /// touching the marker-private `mark_stack`.
-        concurrent: bool = false,
+        /// touching the marker-private `mark_stack`. Atomic for the same reason
+        /// as `marking` — peer mutators read it lock-free under parallel M3.
+        concurrent: std.atomic.Value(bool) = .init(false),
         /// Mutator→marker hand-off buffer for concurrent marking, guarded by
         /// `barrier_lock` (a brief atomic spinlock; no std.Thread.Mutex in this
         /// zig). The marker drains it into `mark_stack` between local rounds.
@@ -205,7 +211,7 @@ pub fn Heap(comptime Binding: type) type {
             /// incremental (M2) marking, where the world is quiescent during the
             /// read, so the binding can skip the lock on those paths.
             pub fn concurrent(v: *Visitor) bool {
-                return v.heap.concurrent;
+                return v.heap.concurrent.load(.acquire);
             }
 
             /// Defer this (already-marked) cell's *tracing* to the world-stopped
@@ -353,13 +359,26 @@ pub fn Heap(comptime Binding: type) type {
             // runs). This is what lets the embedder barrier only post-creation
             // mutations instead of every initializing store. Children added after
             // it is traced are caught by the insertion `writeBarrier`.
-            const born_grey = self.marking;
-            h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = born_grey };
+            const born_grey = self.marking.load(.acquire);
+            // Field-wise init (not a struct literal) so `marked` is written
+            // *atomically*: under a parallel concurrent mark the marker may
+            // `claimMark` this born-grey cell (an atomic CAS) the instant a peer
+            // links it behind a traced object, and a non-atomic store racing
+            // that CAS is a data race. The CAS only fails (born grey ⇒ already
+            // marked), so the marker never traces the half-built payload — the
+            // other header fields stay private until the world-stopped finish.
+            // `magic`/`next`/`size`/`kind` are only read at that finish (or by
+            // sweep under `alloc_lock`), so they need no atomic.
+            h.magic = header_magic;
+            h.next = self.all;
+            h.size = @sizeOf(T);
+            h.kind = kind;
+            @atomicStore(bool, &h.marked, born_grey, .release);
             self.all = h;
             self.live_cells += 1;
             self.bytes_live += total;
             if (born_grey) {
-                if (self.concurrent) {
+                if (self.concurrent.load(.acquire)) {
                     // Allocated on the mutator thread during a concurrent mark.
                     // Born marked (survives this cycle), but DON'T hand it to the
                     // marker yet — the caller is still initializing this payload,
@@ -389,12 +408,12 @@ pub fn Heap(comptime Binding: type) type {
         /// managed payload (the embedder may store non-cell pointers) — so it is
         /// cheap and safe to call broadly. Idempotent (already-grey/black: skip).
         pub fn writeBarrier(self: *Self, cell: ?*anyopaque) void {
-            if (!self.marking) return;
+            if (!self.marking.load(.acquire)) return;
             const p = cell orelse return;
             const h = Self.headerOf(p);
             if (h.magic != header_magic) return;
             if (!self.claimMark(h)) return;
-            if (self.concurrent) {
+            if (self.concurrent.load(.acquire)) {
                 // Hand the greyed cell to the marker thread (it owns mark_stack).
                 self.lockBarrier();
                 self.barrier_buf.append(self.aux, h) catch {};
@@ -409,7 +428,7 @@ pub fn Heap(comptime Binding: type) type {
         /// and a mutator's `writeBarrier` never both push the same cell; the
         /// single-threaded path is a plain check.
         fn claimMark(self: *Self, h: *Header) bool {
-            if (self.concurrent) {
+            if (self.concurrent.load(.acquire)) {
                 if (@cmpxchgStrong(bool, &h.marked, false, true, .acq_rel, .monotonic) != null) return false;
                 _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
                 return true;
@@ -443,7 +462,7 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.clearRetainingCapacity();
             self.weak_slots.clearRetainingCapacity();
             self.addr_index_built = false;
-            self.marking = true;
+            self.marking.store(true, .release);
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
         }
@@ -473,13 +492,13 @@ pub fn Heap(comptime Binding: type) type {
         /// stop-the-world `collect()` no mutation happened, so this re-scan only
         /// re-touches already-marked roots — cheap and harmless.)
         pub fn finishMarking(self: *Self) void {
-            std.debug.assert(self.marking);
+            std.debug.assert(self.marking.load(.acquire));
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
-            self.marking = false;
+            self.marking.store(false, .release);
             self.sweepPhase(&v);
         }
 
@@ -512,7 +531,54 @@ pub fn Heap(comptime Binding: type) type {
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
             self.deferred_trace.clearRetainingCapacity();
-            self.concurrent = true;
+            self.concurrent.store(true, .release);
+        }
+
+        /// Begin a concurrent mark for the *parallel* (multi-mutator, GIL-free)
+        /// model: peer mutators keep allocating and mutating on other threads
+        /// while this runs. Unlike `beginConcurrentMark`, the world is NOT
+        /// stopped, so:
+        ///   - The whiten pass + state reset run under `alloc_lock`, the same
+        ///     leaf lock `create` takes, so the O(n) `all`-list walk and the
+        ///     `marked` clears can't race a peer's prepend / born-grey mark-bit
+        ///     set. `alloc_lock` is a leaf (never held across a safepoint or a
+        ///     per-structure lock), so guarding the walk with it cannot deadlock
+        ///     a mutator that is parked or spinning for an object lock.
+        ///   - `marking`+`concurrent` are published *while still holding*
+        ///     `alloc_lock`, so no cell can be prepended between "whitened" and
+        ///     "barrier armed": a `create` that wins the lock after us already
+        ///     sees `marking` true and is born grey.
+        ///   - After arming the barrier, `Binding.traceRoots` greys the
+        ///     embedder's roots. The embedder is responsible for making that
+        ///     trace touch only roots that are *safe* to read while peers run
+        ///     (its global/realm state, parked-peer stacks, the collector's own
+        ///     stack) and for layering each *running* peer's own roots in via a
+        ///     safepoint handshake (`src/root_handshake.zig`) — a running peer's
+        ///     live VM/native stack can't be read by another thread. Peers'
+        ///     concurrent stores shade through `barrier_buf` and their
+        ///     allocations are born grey, so nothing reachable is missed.
+        /// Requires `parallel`.
+        pub fn beginConcurrentMarkParallel(self: *Self) void {
+            std.debug.assert(self.parallel);
+            self.lockAlloc();
+            var it = self.all;
+            while (it) |h| : (it = h.next) h.marked = false;
+            self.marked_count = 0;
+            self.mark_stack.clearRetainingCapacity();
+            self.weak_slots.clearRetainingCapacity();
+            self.barrier_buf.clearRetainingCapacity();
+            self.born_concurrent.clearRetainingCapacity();
+            self.deferred_trace.clearRetainingCapacity();
+            self.addr_index_built = false;
+            self.marking.store(true, .release);
+            self.concurrent.store(true, .release);
+            self.unlockAlloc();
+            // Grey the embedder's roots into `mark_stack` (only the collector
+            // pushes there; peers route through `barrier_buf`). Mark claims are
+            // atomic now that `concurrent` is set, so this is safe to run while
+            // peers allocate.
+            var v = Visitor{ .heap = self };
+            Binding.traceRoots(self.ctx, &v);
         }
 
         /// One marker-thread round: trace everything currently grey, then fold
@@ -540,8 +606,8 @@ pub fn Heap(comptime Binding: type) type {
         /// remaining hand-off, re-scan roots, drain, run the ephemeron/weak pass,
         /// and sweep. After this `concurrent`/`marking` are off.
         pub fn finishConcurrentMark(self: *Self) void {
-            std.debug.assert(self.marking and self.concurrent);
-            self.concurrent = false; // world is stopped; claims need not be atomic now
+            std.debug.assert(self.marking.load(.acquire) and self.concurrent.load(.acquire));
+            self.concurrent.store(false, .release); // world is stopped; claims need not be atomic now
             var v = Visitor{ .heap = self };
             self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
             self.barrier_buf.clearRetainingCapacity();
@@ -559,13 +625,25 @@ pub fn Heap(comptime Binding: type) type {
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
-            self.marking = false;
+            self.marking.store(false, .release);
             self.sweepPhase(&v);
         }
 
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
         /// stop-the-world and incremental paths. `v` is a live Visitor over self.
+        ///
+        /// Under `parallel` the whole tail runs holding `alloc_lock`: the sweep
+        /// free-loop unlinks from `all` and adjusts the live/bytes counters, and
+        /// the ephemeron/weak walks read `all` + mark bits — all of which a peer
+        /// mutator's `create` touches under the same lock. The collector reaches
+        /// this only after the embedder's terminal root handshake, so peer
+        /// mutators are at safepoints and not tracing the cells being read.
+        /// Finalizers run here must not allocate from this heap (they would
+        /// re-enter `lockAlloc` — a non-reentrant leaf spinlock); this engine's
+        /// finalizers only release native side storage, never allocate cells.
         fn sweepPhase(self: *Self, v: *Visitor) void {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
             // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
             // marked key, its value becomes strong. Iterate to a fixed point so
             // values can keep further keys alive through chains of weak maps.
@@ -676,12 +754,13 @@ const TestRT = struct {
                 const n: *Node = @ptrCast(@alignCast(cell));
                 // Under a concurrent mark the mutator may store into `strong`
                 // while we read it (it then fires the barrier, so the new target
-                // is marked regardless). A bare reference slot the marker reads
-                // and a mutator writes must be accessed atomically to be
-                // race-free per the memory model — a relaxed load/store, which is
-                // a plain mov on x86_64/arm64. This is the pattern the engine
-                // binding uses for its non-collection pointer slots (e.g. proto).
-                const s = if (v.concurrent()) @atomicLoad(?*Node, &n.strong, .monotonic) else n.strong;
+                // is marked regardless). The read is `.acquire` and the mutator's
+                // publishing store `.release`, so when the marker first reaches a
+                // freshly built target through this slot it also observes that
+                // target's field initialization (the release/acquire edge stands
+                // in for the per-structure lock the real engine binding takes
+                // around slot/element reads under a concurrent mark).
+                const s = if (v.concurrent()) @atomicLoad(?*Node, &n.strong, .acquire) else n.strong;
                 v.mark(s);
                 v.markWeak(&n.weak);
             },
@@ -933,7 +1012,7 @@ test "incremental mark: stepped drain matches stop-the-world reachability" {
     while (!heap.markStep(1)) : (steps += 1) {}
     heap.finishMarking();
     try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
-    try std.testing.expect(!heap.marking);
+    try std.testing.expect(!heap.marking.load(.acquire));
 }
 
 test "incremental mark: insertion barrier saves a cell reparented behind a black object" {
@@ -1231,4 +1310,117 @@ test "parallel: multiple mutators allocate concurrently without corrupting the h
     var it = heap.all;
     while (it) |hdr| : (it = hdr.next) walked += 1;
     try std.testing.expectEqual(@as(usize, threads * per), walked);
+}
+
+test "parallel concurrent mark: collector marks + sweeps while mutators allocate, no GIL" {
+    // The mid-script parallel-GC mechanism (issue #1 M3): a concurrent mark runs
+    // while several mutators allocate and build object graphs on other threads
+    // with no GIL. Exercises the three parallel-safe paths together —
+    //   - `beginConcurrentMarkParallel`: whitens + arms the barrier under
+    //     `alloc_lock` while peers are mid-`create`;
+    //   - `concurrentMarkRound`: the marker drains its stack + the peers'
+    //     `barrier_buf` hand-off while they keep mutating;
+    //   - `sweepPhase` under `parallel`: the final sweep unlinks dead cells from
+    //     `all` while (quiesced-at-finish) peers could still hold `alloc_lock`.
+    // Determinism: each mutator builds a PRIVATE chain under its OWN rooted
+    // holder, so a chain node is always reachable from a root and survives; the
+    // pre-begin garbage is never linked, stays white, and is reclaimed. TSan
+    // proves the whiten/mark/sweep vs. parallel-`create`/`writeBarrier` paths
+    // are race-free.
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    heap.backing = std.heap.page_allocator; // thread-safe cell slabs
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const threads = 4;
+    const chain_per = 500;
+    const garbage_n = 800;
+
+    // Rooted holders, one per mutator (so chains never share a slot).
+    var holders: [threads]*N = undefined;
+    for (&holders, 0..) |*slot, i| {
+        const h = try heap.create(N, .node);
+        h.* = .{ .id = @intCast(1000 + i) };
+        slot.* = h;
+        try rt.roots.append(a, h);
+    }
+    // Pre-begin garbage: white, never linked → must be swept.
+    var g: usize = 0;
+    while (g < garbage_n) : (g += 1) {
+        const node = try heap.create(N, .node);
+        node.* = .{ .id = 7 };
+    }
+
+    const Shared = struct {
+        heap: *Heap(TestRT),
+        holders: []*N,
+        started: std.atomic.Value(u32) = .init(0),
+        done: std.atomic.Value(u32) = .init(0),
+
+        fn markLoop(s: *@This()) void {
+            // Drain rounds until every mutator is done and a final round is
+            // clean (nothing left grey / handed off).
+            while (true) {
+                const q = s.heap.concurrentMarkRound();
+                if (s.done.load(.acquire) == threads and q) break;
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+    const Worker = struct {
+        s: *Shared,
+        idx: usize,
+        fn run(w: *@This()) void {
+            _ = w.s.started.fetchAdd(1, .release);
+            // Build a private chain of fresh nodes under this thread's holder.
+            // Each `create` is a parallel allocation (born grey once the mark is
+            // armed); the link store fires the insertion barrier.
+            var prev = w.s.holders[w.idx];
+            var i: u32 = 0;
+            while (i < chain_per) : (i += 1) {
+                const node = w.s.heap.create(N, .node) catch return;
+                node.* = .{ .id = i };
+                // Release store: publishes `node`'s initialization to the marker,
+                // which reads this slot with an acquire load (see `TestRT.trace`).
+                @atomicStore(?*N, &prev.strong, node, .release);
+                w.s.heap.writeBarrier(node);
+                prev = node;
+            }
+            _ = w.s.done.fetchAdd(1, .release);
+        }
+    };
+    var shared = Shared{ .heap = &heap, .holders = holders[0..] };
+
+    // Spawn mutators first; begin the mark while they are already allocating, so
+    // the whiten pass races live `create` calls.
+    var workers: [threads]Worker = undefined;
+    for (&workers, 0..) |*w, i| w.* = .{ .s = &shared, .idx = i };
+    var mpool: [threads]std.Thread = undefined;
+    for (&mpool, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
+    // Let at least one mutator get into its allocation loop before arming.
+    while (shared.started.load(.acquire) == 0) std.atomic.spinLoopHint();
+    heap.beginConcurrentMarkParallel();
+    const mk = try std.Thread.spawn(.{}, Shared.markLoop, .{&shared});
+
+    for (&mpool) |*t| t.join();
+    mk.join();
+    // Mutators quiesced (joined): finish + sweep.
+    heap.finishConcurrentMark();
+
+    // Every holder + its full chain survives; the pre-begin garbage is gone.
+    try std.testing.expectEqual(@as(usize, threads * (1 + chain_per)), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, garbage_n), rt.finalized.items.len);
+    for (holders) |h| {
+        var cur: ?*N = h.strong;
+        var count: usize = 0;
+        while (cur) |c| : (cur = c.strong) count += 1;
+        try std.testing.expectEqual(@as(usize, chain_per), count);
+    }
 }

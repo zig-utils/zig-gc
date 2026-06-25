@@ -10,12 +10,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // `-Dtsan` builds the unit tests under ThreadSanitizer — the concurrency
+    // gate for the parallel/concurrent collector paths (issue #1 M3). The
+    // parallel marking/allocation/sweep tests must stay race-free under it.
+    const tsan = b.option(bool, "tsan", "Build unit tests with ThreadSanitizer") orelse false;
+
     // Unit tests over the collector core.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = tsan,
         }),
     });
     const run_tests = b.addRunArtifact(tests);
