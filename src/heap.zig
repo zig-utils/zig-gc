@@ -655,6 +655,42 @@ pub fn Heap(comptime Binding: type) type {
             self.unlockAlloc();
         }
 
+        /// Collector: build the address-sorted interior-pointer index now, before
+        /// opening the root handshake. Running peers' `barrierConservativeWord`
+        /// self-publish then only *reads* the index — safe concurrently — because
+        /// the collector built it first (the handshake's release/acquire
+        /// establishes the happens-before so peers observe `addr_index_built`).
+        pub fn ensureAddrIndex(self: *Self) void {
+            // The build walks the `all` list; under parallel mutation a concurrent
+            // `create` prepends to it, so freeze allocation for the walk.
+            self.lockAlloc();
+            defer self.unlockAlloc();
+            if (!self.addr_index_built) self.buildAddrIndex();
+        }
+
+        /// Mutator self-publish for the parallel concurrent mark: conservatively
+        /// grey the cell that stack `word` points into (interior-pointer aware),
+        /// routing the grey to the marker via `barrier_buf` — never the
+        /// marker-owned `mark_stack`. The collector must have called
+        /// `ensureAddrIndex` before any peer calls this; if the index isn't built
+        /// yet this is a no-op (the cell, if live, is still reachable from another
+        /// root or is born-marked, and the collector's re-scan catches stragglers).
+        pub fn barrierConservativeWord(self: *Self, word: usize) void {
+            if (!self.addr_index_built) return;
+            const h = self.headerForInteriorAddress(word) orelse return;
+            if (!self.claimMark(h)) return;
+            self.lockBarrier();
+            self.barrier_buf.append(self.aux, h) catch {};
+            self.unlockBarrier();
+        }
+
+        /// `barrierConservativeWord` over a word-aligned range (a peer's own stack
+        /// + spilled registers). Same routing + safety contract.
+        pub fn barrierConservativeWords(self: *Self, start: [*]const usize, words: usize) void {
+            var i: usize = 0;
+            while (i < words) : (i += 1) self.barrierConservativeWord(start[i]);
+        }
+
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
         /// stop-the-world and incremental paths. `v` is a live Visitor over self.
         fn sweepPhase(self: *Self, v: *Visitor) void {
@@ -773,7 +809,7 @@ const TestRT = struct {
                 // race-free per the memory model — a relaxed load/store, which is
                 // a plain mov on x86_64/arm64. This is the pattern the engine
                 // binding uses for its non-collection pointer slots (e.g. proto).
-                const s = if (v.concurrent()) @atomicLoad(?*Node, &n.strong, .monotonic) else n.strong;
+                const s = if (v.concurrent()) @atomicLoad(?*Node, &n.strong, .acquire) else n.strong;
                 v.mark(s);
                 v.markWeak(&n.weak);
             },
@@ -1396,7 +1432,7 @@ test "parallel concurrent collection: collect mid-script while mutators run (no-
                 node.* = .{ .id = s.base + i };
                 const old = @atomicLoad(?*N, &s.root.strong, .monotonic);
                 @atomicStore(?*N, &node.strong, old, .monotonic);
-                @atomicStore(?*N, &s.root.strong, node, .monotonic);
+                @atomicStore(?*N, &s.root.strong, node, .release);
                 s.heap.writeBarrier(node); // node newly reachable from root → grey
                 if (i % 64 == 0) s.safepoint();
             }
@@ -1466,6 +1502,140 @@ test "parallel concurrent collection: collect mid-script while mutators run (no-
     // Correctness 2: the pre-existing garbage was reclaimed (collector swept).
     try std.testing.expectEqual(@as(usize, garbage), rt.finalized.items.len);
     // Correctness 3: live_cells == N roots + N*per chain nodes (garbage gone).
+    try std.testing.expectEqual(@as(usize, nworkers * (per + 1)), heap.live_cells);
+    try std.testing.expect(heap.collections >= 1);
+}
+
+test "parallel concurrent collection: peers self-publish CONSERVATIVELY (interior pointers, no-GIL M3)" {
+    // Like the test above, but running peers publish their root via
+    // `barrierConservativeWord` (interior-pointer resolution → grey via
+    // barrier_buf) instead of the exact-pointer `writeBarrier`. This is the
+    // engine's actual root-publish mode (a peer conservatively scans its own
+    // native stack at a safepoint), and it exercises the address-index built by
+    // the collector before the handshake opens being *read* concurrently by N
+    // peers — the hazard that makes conservative self-publish the hard part of
+    // wiring this into the live engine. Live chains intact + garbage reclaimed +
+    // (CI) TSan-clean proves the index read + barrier routing is race-free.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    heap.backing = std.heap.page_allocator;
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const nworkers = 4;
+    const per = 1500;
+    const garbage = 600;
+
+    var g: u32 = 0;
+    while (g < garbage) : (g += 1) {
+        const junk = try heap.create(N, .node);
+        junk.* = .{ .id = 1_000_000 + g };
+    }
+    var roots: [nworkers]*N = undefined;
+    for (&roots) |*r| {
+        r.* = try heap.create(N, .node);
+        r.*.* = .{ .id = 0 };
+    }
+
+    const Shared = struct {
+        hs_request: std.atomic.Value(u64) = .init(0),
+        hs_acks: std.atomic.Value(u32) = .init(0),
+        done_building: std.atomic.Value(u32) = .init(0),
+        collection_done: std.atomic.Value(bool) = .init(false),
+    };
+    const Worker = struct {
+        heap: *Heap(TestRT),
+        sh: *Shared,
+        root: *N,
+        base: u32,
+        published: u64 = 0,
+        fn safepoint(s: *@This()) void {
+            const req = s.sh.hs_request.load(.acquire);
+            if (req == 0 or s.published == req) return;
+            // Conservative interior-pointer publish (the engine's mode): treat the
+            // live root as a stack word and route it through barrier_buf. The
+            // happens-before from this acquire-load of `req` (paired with the
+            // collector's release-store in `open`) guarantees we observe the
+            // collector's built addr-index.
+            s.heap.barrierConservativeWord(@intFromPtr(s.root));
+            s.published = req;
+            _ = s.sh.hs_acks.fetchAdd(1, .release);
+        }
+        fn run(s: *@This()) void {
+            var i: u32 = 1;
+            while (i <= per) : (i += 1) {
+                const node = s.heap.create(N, .node) catch return;
+                node.* = .{ .id = s.base + i };
+                const old = @atomicLoad(?*N, &s.root.strong, .monotonic);
+                @atomicStore(?*N, &node.strong, old, .monotonic);
+                @atomicStore(?*N, &s.root.strong, node, .release);
+                s.heap.writeBarrier(node);
+                if (i % 64 == 0) s.safepoint();
+            }
+            _ = s.sh.done_building.fetchAdd(1, .release);
+            while (!s.sh.collection_done.load(.acquire)) {
+                s.safepoint();
+                std.atomic.spinLoopHint();
+            }
+        }
+    };
+
+    var shared = Shared{};
+    var workers: [nworkers]Worker = undefined;
+    for (&workers, 0..) |*w, t| w.* = .{ .heap = &heap, .sh = &shared, .root = roots[t], .base = @as(u32, @intCast(t)) * per };
+    var pool: [nworkers]std.Thread = undefined;
+    for (&pool, 0..) |*th, t| th.* = try std.Thread.spawn(.{}, Worker.run, .{&workers[t]});
+
+    heap.beginConcurrentMarkParallel();
+    heap.ensureAddrIndex(); // BEFORE the handshake: peers only read the index
+    heap.greyRoots();
+    var cycle: u64 = 1;
+    while (true) {
+        const before = @atomicLoad(usize, &heap.marked_count, .monotonic);
+        shared.hs_acks.store(0, .monotonic);
+        shared.hs_request.store(cycle, .release);
+        while (shared.hs_acks.load(.acquire) < nworkers) {
+            _ = heap.concurrentMarkRound();
+            std.atomic.spinLoopHint();
+        }
+        while (!heap.concurrentMarkRound()) {}
+        shared.hs_request.store(0, .release);
+        cycle += 1;
+        if (shared.done_building.load(.acquire) == nworkers and
+            @atomicLoad(usize, &heap.marked_count, .monotonic) == before) break;
+    }
+    heap.markOffParallel();
+    shared.hs_acks.store(0, .monotonic);
+    shared.hs_request.store(cycle, .release);
+    while (shared.hs_acks.load(.acquire) < nworkers) std.atomic.spinLoopHint();
+    shared.hs_request.store(0, .release);
+    heap.sweepConcurrentParallel();
+    shared.collection_done.store(true, .release);
+    for (&pool) |*th| th.join();
+
+    for (&roots, 0..) |r, t| {
+        const base: u32 = @as(u32, @intCast(t)) * per;
+        var count: usize = 0;
+        var expect_sum: u64 = 0;
+        var got_sum: u64 = 0;
+        var cur = @atomicLoad(?*N, &r.strong, .monotonic);
+        while (cur) |c| : (cur = c.strong) {
+            count += 1;
+            got_sum += c.id;
+        }
+        var k: u32 = 1;
+        while (k <= per) : (k += 1) expect_sum += base + k;
+        try std.testing.expectEqual(@as(usize, per), count);
+        try std.testing.expectEqual(expect_sum, got_sum);
+    }
+    try std.testing.expectEqual(@as(usize, garbage), rt.finalized.items.len);
     try std.testing.expectEqual(@as(usize, nworkers * (per + 1)), heap.live_cells);
     try std.testing.expect(heap.collections >= 1);
 }
