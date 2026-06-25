@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.131+73c51c142
+          version: 0.17.0-dev.956+2dca73595
       - name: unit tests
         run: zig build test
 
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.131+73c51c142
+          version: 0.17.0-dev.956+2dca73595
       - name: ThreadSanitizer (loop the parallel collector to surface races)
         env:
           TSAN_OPTIONS: halt_on_error=1
