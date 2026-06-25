@@ -362,7 +362,11 @@ pub fn Heap(comptime Binding: type) type {
             h.* = .{ .magic = header_magic, .next = self.all, .size = @sizeOf(T), .kind = kind, .marked = born_grey };
             self.all = h;
             self.live_cells += 1;
-            self.bytes_live += total;
+            // Atomic: a parallel mutator at a GC safepoint reads `bytes_live` for
+            // its collection-threshold check (Context.collectMidScriptParallel)
+            // without taking `alloc_lock`, so the increment must be atomic to pair
+            // with that read race-free. Identical value single-threaded.
+            _ = @atomicRmw(usize, &self.bytes_live, .Add, total, .monotonic);
             if (born_grey) {
                 if (self.concurrent.load(.acquire)) {
                     // Allocated on the mutator thread during a concurrent mark.
