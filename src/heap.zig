@@ -186,9 +186,12 @@ pub fn Heap(comptime Binding: type) type {
             /// teaching the collector about their frame layout.
             pub fn markConservativeWord(v: *Visitor, word: usize) void {
                 const h = v.heap.headerForInteriorAddress(word) orelse return;
-                if (h.marked) return;
-                h.marked = true;
-                v.heap.marked_count += 1;
+                // `claimMark` is the atomic CAS under a concurrent/parallel mark
+                // (and a plain check otherwise), so a conservative root claim
+                // can't race a peer mutator's `writeBarrier` claim on the same
+                // cell. `mark_stack` stays collector-private, so the append is
+                // single-threaded.
+                if (!v.heap.claimMark(h)) return;
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
                 };
@@ -309,6 +312,12 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn buildAddrIndex(self: *Self) void {
+            // Snapshot the all-list under `alloc_lock` so a peer mutator's
+            // `create` (which prepends to `all`) can't race the walk. New cells
+            // born after this snapshot aren't in the index — fine: they are born
+            // marked, so a conservative pointer into one needs no index hit.
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
             self.addr_index.clearRetainingCapacity();
             var it = self.all;
             while (it) |h| : (it = h.next) {
@@ -629,6 +638,127 @@ pub fn Heap(comptime Binding: type) type {
             self.sweepPhase(&v);
         }
 
+        /// Pending mutator-allocated cells not yet folded into the mark (M3
+        /// parallel). The driver watches this for *stability* across two
+        /// all-published handshake rounds: a stable count means no peer is
+        /// mid-allocation, so every born cell's payload is fully initialized and
+        /// safe to fold at `finishConcurrentMarkParallel`.
+        pub fn bornPendingLen(self: *Self) usize {
+            self.lockAlloc();
+            defer self.unlockAlloc();
+            return self.born_concurrent.items.len;
+        }
+
+        /// Cells whose tracing the marker deferred to finish (generators /
+        /// iterator helpers whose mutable `exec`/`inner` can't be read while the
+        /// owning mutator runs). The parallel driver refuses to finish (aborts)
+        /// while this is non-empty, because a *running* peer's deferred cell
+        /// can't be traced soundly — only a world-stopped or quiescent finish can.
+        pub fn deferredPendingLen(self: *Self) usize {
+            return self.deferred_trace.items.len;
+        }
+
+        /// Finish a concurrent mark in the PARALLEL model — peers keep running,
+        /// no stop-the-world. The caller (the engine's mid-script driver) must
+        /// have confirmed via the root handshake that **every peer published the
+        /// current generation**, that `born_concurrent` is **stable** (no peer
+        /// mid-allocation, so every born payload is initialized), and that
+        /// `deferred_trace` is **empty**. Given that, marking has reached closure
+        /// over all live roots, and any store a peer makes from here can only
+        /// shade a cell reachable from its already-published (and traced) roots —
+        /// i.e. an already-marked cell — so it is sound to drain and sweep
+        /// without freezing the world. Claims stay atomic until the final
+        /// `marking=false`; the sweep runs under `alloc_lock` (`sweepPhase`).
+        /// Returns true if it swept, false if it had to bail (a peer allocated
+        /// during the finish, so newly-born cells would be untraced and their
+        /// un-barriered creation-time references could be missed); on false the
+        /// caller aborts (`abortConcurrentMarkParallel`), freeing nothing.
+        pub fn finishConcurrentMarkParallel(self: *Self) bool {
+            std.debug.assert(self.parallel and self.marking.load(.acquire) and self.concurrent.load(.acquire));
+            var v = Visitor{ .heap = self };
+            // Fold the born cells (initialized, per the caller's stability
+            // guarantee) and any deferred cells under `alloc_lock` so a peer
+            // can't append a fresh half-built born cell while we read the list.
+            // Tracing these born cells is what catches their creation-time
+            // references (e.g. an `Environment.parent`) which the insertion
+            // barrier does NOT cover — so their (possibly white) parents survive.
+            self.lockAlloc();
+            self.mark_stack.appendSlice(self.aux, self.born_concurrent.items) catch {};
+            self.born_concurrent.clearRetainingCapacity();
+            for (self.deferred_trace.items) |h| self.mark_stack.append(self.aux, h) catch {};
+            self.deferred_trace.clearRetainingCapacity();
+            self.unlockAlloc();
+            // Re-scan the collector-safe roots (the driver leaves `traceRoots` in
+            // parallel mode: realm roots locked + the collector's own interpreter;
+            // running peers self-published), then drain to closure, folding any
+            // late barrier hand-offs. Post-closure hand-offs are necessarily
+            // already-marked (see the doc comment), so the loop terminates.
+            Binding.traceRoots(self.ctx, &v);
+            var passes: usize = 0;
+            while (passes < 64) : (passes += 1) {
+                while (self.mark_stack.pop()) |h| Binding.trace(payloadOf(h), h.kind, &v);
+                self.lockBarrier();
+                const handed = self.barrier_buf.items.len;
+                if (handed > 0) {
+                    self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
+                    self.barrier_buf.clearRetainingCapacity();
+                }
+                self.unlockBarrier();
+                if (handed == 0 and self.mark_stack.items.len == 0) break;
+            }
+            // Sweep ONLY if no peer allocated during the trace/drain above — i.e.
+            // `born_concurrent` is still empty. A non-empty list means new cells
+            // were born whose creation-time references we didn't trace and whose
+            // (possibly white) targets could be swept; rather than risk that, bail
+            // and let the caller abort (freeing nothing is always sound). Hold
+            // `alloc_lock` across the check AND the sweep so no cell can be born
+            // between them. The sweep takes no other lock that a peer holds while
+            // waiting on `alloc_lock`, so this can't deadlock.
+            self.lockAlloc();
+            if (self.born_concurrent.items.len != 0) {
+                self.unlockAlloc();
+                return false;
+            }
+            // Closure reached, no new allocation. Disarm the barrier (a later
+            // peer store now no-ops: its target is reachable-from-roots → already
+            // marked, or genuinely unreachable → correctly white), then sweep
+            // while still holding `alloc_lock` (so the all-list is stable).
+            self.marking.store(false, .release);
+            self.concurrent.store(false, .release);
+            self.sweepPhaseLocked(&v); // alloc_lock already held
+            self.unlockAlloc();
+            return true;
+        }
+
+        /// Whether live bytes have crossed the collection threshold, read under
+        /// `alloc_lock` in `parallel` mode so a mid-script collector's safepoint
+        /// check doesn't race a peer's `create` updating `bytes_live`.
+        pub fn shouldCollect(self: *Self) bool {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            return self.bytes_live >= self.threshold_bytes;
+        }
+
+        /// Abort an in-progress parallel concurrent mark WITHOUT sweeping: clear
+        /// the marking state and the scratch buffers, freeing nothing. Sound at
+        /// any time — an aborted mark just leaves some cells marked (re-whitened
+        /// by the next `beginConcurrentMarkParallel` / `startMarking`). The driver
+        /// calls this when it can't reach a stable finish within its round budget
+        /// (heavy continuous allocation, or a deferred generator), falling back to
+        /// the next quiescent `collect`.
+        pub fn abortConcurrentMarkParallel(self: *Self) void {
+            self.marking.store(false, .release);
+            self.concurrent.store(false, .release);
+            self.lockBarrier();
+            self.barrier_buf.clearRetainingCapacity();
+            self.unlockBarrier();
+            self.lockAlloc();
+            self.born_concurrent.clearRetainingCapacity();
+            self.unlockAlloc();
+            self.mark_stack.clearRetainingCapacity();
+            self.deferred_trace.clearRetainingCapacity();
+        }
+
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
         /// stop-the-world and incremental paths. `v` is a live Visitor over self.
         ///
@@ -644,6 +774,13 @@ pub fn Heap(comptime Binding: type) type {
         fn sweepPhase(self: *Self, v: *Visitor) void {
             if (self.parallel) self.lockAlloc();
             defer if (self.parallel) self.unlockAlloc();
+            self.sweepPhaseLocked(v);
+        }
+
+        /// The sweep tail proper, assuming `alloc_lock` is already held under
+        /// `parallel` (the parallel finish holds it across its born-empty check
+        /// and the sweep so no cell is born in between).
+        fn sweepPhaseLocked(self: *Self, v: *Visitor) void {
             // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
             // marked key, its value becomes strong. Iterate to a fixed point so
             // values can keep further keys alive through chains of weak maps.
