@@ -437,7 +437,7 @@ pub fn Heap(comptime Binding: type) type {
         /// and a mutator's `writeBarrier` never both push the same cell; the
         /// single-threaded path is a plain check.
         fn claimMark(self: *Self, h: *Header) bool {
-            if (self.concurrent.load(.acquire)) {
+            if (self.parallel or self.concurrent.load(.acquire)) {
                 if (@cmpxchgStrong(bool, &h.marked, false, true, .acq_rel, .monotonic) != null) return false;
                 _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
                 return true;
@@ -549,10 +549,20 @@ pub fn Heap(comptime Binding: type) type {
         /// stopped, so:
         ///   - The whiten pass + state reset run under `alloc_lock`, the same
         ///     leaf lock `create` takes, so the O(n) `all`-list walk and the
-        ///     `marked` clears can't race a peer's prepend / born-grey mark-bit
-        ///     set. `alloc_lock` is a leaf (never held across a safepoint or a
-        ///     per-structure lock), so guarding the walk with it cannot deadlock
-        ///     a mutator that is parked or spinning for an object lock.
+        ///     born-grey mark-bit set can't race a peer's prepend. `alloc_lock`
+        ///     is a leaf (never held across a safepoint or a per-structure
+        ///     lock), so guarding the walk with it cannot deadlock a mutator
+        ///     that is parked or spinning for an object lock. The whiten *stores*
+        ///     to `marked` are atomic because `alloc_lock` does NOT serialize the
+        ///     barrier path: a peer still finishing a store from the *previous*
+        ///     cycle (it read `marking` true before the prior finish cleared it)
+        ///     reaches `claimMark`, whose CAS atomically touches `marked` without
+        ///     `alloc_lock`. That CAS is always a benign no-op here — its target
+        ///     was reachable-and-marked last cycle, so the strong CAS fails and
+        ///     `writeBarrier` returns before mutating any list (a successful CAS
+        ///     would mean a swept-garbage target, which the terminal root
+        ///     handshake already rules out). Atomic-vs-atomic is race-free; the
+        ///     new cycle's happens-before is the `marking`=true release below.
         ///   - `marking`+`concurrent` are published *while still holding*
         ///     `alloc_lock`, so no cell can be prepended between "whitened" and
         ///     "barrier armed": a `create` that wins the lock after us already
@@ -571,7 +581,10 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(self.parallel);
             self.lockAlloc();
             var it = self.all;
-            while (it) |h| : (it = h.next) h.marked = false;
+            // Atomic store: a lagging peer's `claimMark` CAS (barrier path, no
+            // `alloc_lock`) can touch the same `marked` byte concurrently. See
+            // the whiten note in the doc comment above.
+            while (it) |h| : (it = h.next) @atomicStore(bool, &h.marked, false, .monotonic);
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             self.weak_slots.clearRetainingCapacity();
