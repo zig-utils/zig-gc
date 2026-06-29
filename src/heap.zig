@@ -425,7 +425,12 @@ pub fn Heap(comptime Binding: type) type {
             if (self.concurrent.load(.acquire)) {
                 // Hand the greyed cell to the marker thread (it owns mark_stack).
                 self.lockBarrier();
-                self.barrier_buf.append(self.aux, h) catch {};
+                // A parallel collector can abort between the lock-free
+                // `concurrent` check above and this critical section. Re-check
+                // while holding the hand-off lock so a stale mutator cannot
+                // append into `barrier_buf` after abort cleared it.
+                if (self.marking.load(.acquire) and self.concurrent.load(.acquire))
+                    self.barrier_buf.append(self.aux, h) catch {};
                 self.unlockBarrier();
             } else {
                 self.mark_stack.append(self.aux, h) catch {};
@@ -1573,4 +1578,43 @@ test "parallel concurrent mark: collector marks + sweeps while mutators allocate
         while (cur) |c| : (cur = c.strong) count += 1;
         try std.testing.expectEqual(@as(usize, chain_per), count);
     }
+}
+
+test "parallel concurrent mark: stale barrier append after abort is ignored" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const node = try heap.create(TestRT.Node, .node);
+    node.* = .{ .id = 42 };
+    const hdr = Heap(TestRT).headerOf(node);
+    @atomicStore(bool, &hdr.marked, false, .monotonic);
+    heap.marked_count = 0;
+    heap.marking.store(true, .release);
+    heap.concurrent.store(true, .release);
+
+    heap.lockBarrier();
+    const Worker = struct {
+        heap: *Heap(TestRT),
+        node: *TestRT.Node,
+        fn run(w: *@This()) void {
+            w.heap.writeBarrier(w.node);
+        }
+    };
+    var worker = Worker{ .heap = &heap, .node = node };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    while (!@atomicLoad(bool, &hdr.marked, .acquire)) std.atomic.spinLoopHint();
+    heap.marking.store(false, .release);
+    heap.concurrent.store(false, .release);
+    heap.barrier_buf.clearRetainingCapacity();
+    heap.unlockBarrier();
+    t.join();
+
+    try std.testing.expectEqual(@as(usize, 0), heap.barrier_buf.items.len);
 }
