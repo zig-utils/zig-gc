@@ -396,6 +396,11 @@ pub fn Heap(comptime Binding: type) type {
                     _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
                     self.born_concurrent.append(self.aux, h) catch {};
                 } else {
+                    // A parallel mutator can observe a stale `marking=true`
+                    // just after abort/finish cleared `concurrent`. The cell is
+                    // born marked but no collection is active enough to consume
+                    // it; do not touch the marker-private stack from this thread.
+                    if (self.parallel) return @ptrCast(@alignCast(slab.ptr + header_stride));
                     self.marked_count += 1;
                     self.mark_stack.append(self.aux, h) catch {};
                 }
@@ -433,6 +438,12 @@ pub fn Heap(comptime Binding: type) type {
                     self.barrier_buf.append(self.aux, h) catch {};
                 self.unlockBarrier();
             } else {
+                // In a parallel heap, mutators must never append to the
+                // marker-private stack. This branch is reachable only from a
+                // stale `marking=true` observation during abort/finish, after
+                // `concurrent` has been cleared; the claim is harmless and the
+                // next cycle re-whitens every cell.
+                if (self.parallel) return;
                 self.mark_stack.append(self.aux, h) catch {};
             }
         }
