@@ -485,6 +485,17 @@ pub fn Heap(comptime Binding: type) type {
             while (it) |h| : (it = h.next) h.marked = false;
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
+            // Reserve the mark stack to the live-cell count up front — the grey
+            // set can never exceed it (each cell is greyed at most once). A
+            // *concurrent* marker then appends into this pre-allocated buffer for
+            // the whole cycle without reallocating from `aux`, so its writes never
+            // reuse a page the mutator just freed from a side-store (e.g. a
+            // growing WeakMap's `weak_entries`) mid-mark — the cross-thread
+            // allocator page-reuse ThreadSanitizer flags on the no-GIL concurrent
+            // path. Reserved before roots are traced (still at the safepoint) so
+            // even the initial root push is covered. Cells born during the cycle
+            // are folded in at the world-stopped finish, where a grow is safe.
+            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.weak_slots.clearRetainingCapacity();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -603,6 +614,12 @@ pub fn Heap(comptime Binding: type) type {
             while (it) |h| : (it = h.next) @atomicStore(bool, &h.marked, false, .monotonic);
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
+            // Pre-reserve the mark stack to the live-cell count (see the note in
+            // `startMarking`): the concurrent/parallel marker then appends into
+            // it for the whole cycle without reallocating from `aux`, so its
+            // writes never reuse a page a mutator just freed from a side-store
+            // mid-mark — the cross-thread allocator page-reuse TSan flags.
+            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.weak_slots.clearRetainingCapacity();
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
