@@ -176,7 +176,12 @@ pub fn Heap(comptime Binding: type) type {
             pub fn isMarked(v: *Visitor, cell: ?*anyopaque) bool {
                 _ = v;
                 const p = cell orelse return false;
-                return Self.headerOf(p).marked;
+                // Atomic: the parallel marker reads `marked` (here, in the sweep
+                // phase, and in conservative marking) while a mutator's `claimMark`
+                // write barrier CASes it (`.acq_rel`); a plain read races that. A
+                // relaxed load is a plain mov — the marking-phase handshake already
+                // orders it — so this is free.
+                return @atomicLoad(bool, &Self.headerOf(p).marked, .monotonic);
             }
 
             /// Conservatively mark a machine word if it points at the payload
@@ -289,7 +294,7 @@ pub fn Heap(comptime Binding: type) type {
         pub fn isLive(self: *Self, p: ?*anyopaque) bool {
             _ = self;
             const ptr = p orelse return false;
-            return headerOf(ptr).marked;
+            return @atomicLoad(bool, &headerOf(ptr).marked, .monotonic); // vs concurrent claimMark CAS
         }
 
         fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
@@ -835,7 +840,7 @@ pub fn Heap(comptime Binding: type) type {
                     const before = self.marked_count;
                     var eit = self.all;
                     while (eit) |h| : (eit = h.next) {
-                        if (h.marked) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
+                        if (@atomicLoad(bool, &h.marked, .monotonic)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
                     }
                     while (self.mark_stack.pop()) |h| {
                         Binding.trace(payloadOf(h), h.kind, v);
@@ -848,14 +853,14 @@ pub fn Heap(comptime Binding: type) type {
             //    frees it, so no slot ever dangles.
             for (self.weak_slots.items) |slot| {
                 if (slot.*) |target| {
-                    if (!headerOf(target).marked) slot.* = null;
+                    if (!@atomicLoad(bool, &headerOf(target).marked, .monotonic)) slot.* = null;
                 }
             }
 
             if (@hasDecl(Binding, "afterWeak")) {
                 var wit = self.all;
                 while (wit) |h| : (wit = h.next) {
-                    if (h.marked) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
+                    if (@atomicLoad(bool, &h.marked, .monotonic)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
                 }
             }
 
@@ -864,7 +869,7 @@ pub fn Heap(comptime Binding: type) type {
             var cur = self.all;
             while (cur) |h| {
                 const next = h.next;
-                if (h.marked) {
+                if (@atomicLoad(bool, &h.marked, .monotonic)) {
                     prev = h;
                 } else {
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
