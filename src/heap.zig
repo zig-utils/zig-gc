@@ -694,6 +694,13 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            // Weak-slot registration can run while a concurrent marker traces
+            // object cells and mutators grow their own side storage. Reserve the
+            // per-cycle scratch up front, at the safepoint, so `markWeak` never
+            // reallocates from `aux` mid-mark and reuses a page concurrently with
+            // a mutator's object-backing write (the same allocator-reuse TSan
+            // class the mark-stack reservation avoids).
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -769,6 +776,10 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            // A minor cycle can still trace old roots/remembered owners that
+            // register weak slots, so reserve to the full live-cell bound rather
+            // than only the young-cell count.
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -876,6 +887,10 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            // See `startMarking`: weak-slot scratch is marker-side state, but it
+            // must not allocate from `aux` while parallel mutators are growing
+            // object backing stores.
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
