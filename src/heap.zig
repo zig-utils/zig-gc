@@ -230,18 +230,17 @@ pub fn Heap(comptime Binding: type) type {
 
             /// Whether `cell` is one of this heap's managed payloads. Bindings use
             /// this before marking legacy/embedder pointers that may still point
-            /// outside the GC heap. O(1): reads the candidate header's magic
-            /// (exactly the check `mark` makes), so it does **not** walk the
-            /// all-cells list — which would both cost O(n) per call and race the
-            /// mutator's `create` prepending to that list during a concurrent
-            /// mark. Callers must only pass pointers into mapped memory (a GC cell
-            /// or another live engine allocation, e.g. an arena cell), never a
-            /// freed or wild pointer; arena bytes simply won't match the magic.
+            /// outside the GC heap. Unlike `mark`, this predicate must tolerate
+            /// stale or wild values: root tracers often use it specifically at
+            /// mixed ownership boundaries, where a header peek would turn a bad
+            /// legacy pointer into a collector crash. So this walks the heap's
+            /// live-cell list for an exact payload match instead of reading from
+            /// the candidate address. The walk is intentionally paid only by
+            /// "maybe managed" compatibility edges; precise edges should call
+            /// `mark` directly.
             pub fn isManaged(v: *Visitor, cell: ?*anyopaque) bool {
-                _ = v;
                 const p = cell orelse return false;
-                if (!std.mem.isAligned(@intFromPtr(p), 16)) return false;
-                return Self.headerOf(p).magic == header_magic;
+                return v.heap.headerForPayload(p) != null;
             }
 
             /// Whether a cell is already black/grey in the current collection.
@@ -375,6 +374,8 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
             var it = self.all;
             while (it) |h| : (it = h.next) {
                 if (payloadOf(h) == payload) return h;
@@ -1586,6 +1587,28 @@ test "mark-sweep: optional conservative words root payload and interior pointers
     try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
     try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
+}
+
+test "visitor isManaged tolerates non-heap pointer values" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const live = try heap.create(TestRT.Node, .node);
+    live.* = .{ .id = 7 };
+
+    var visitor = Heap(TestRT).Visitor{ .heap = &heap };
+    try std.testing.expect(visitor.isManaged(live));
+
+    var stack_value: usize = 0;
+    try std.testing.expect(!visitor.isManaged(@ptrCast(&stack_value)));
+
+    const wild: *anyopaque = @ptrFromInt(@as(usize, 0x1000_0000_0000));
+    try std.testing.expect(!visitor.isManaged(wild));
 }
 
 const EphRT = struct {
