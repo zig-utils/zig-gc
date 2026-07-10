@@ -40,6 +40,9 @@ pub fn Heap(comptime Binding: type) type {
             size: usize,
             kind: Kind,
             marked: bool,
+            young: bool,
+            remembered_owner: bool,
+            remembered_target: bool,
         };
 
         /// Fixed offset from a header to its payload. 16-byte aligned so any
@@ -71,6 +74,19 @@ pub fn Heap(comptime Binding: type) type {
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
         marked_count: usize = 0,
         collections: usize = 0,
+        full_collections: usize = 0,
+        minor_collections: usize = 0,
+        promoted_cells: usize = 0,
+        promoted_bytes: usize = 0,
+        young_cells: usize = 0,
+        young_bytes: usize = 0,
+        nursery_threshold_bytes: usize = 256 * 1024,
+        nursery_enabled: bool = false,
+        collection_kind: CollectionKind = .full,
+        remembered_owners: std.ArrayListUnmanaged(*Header) = .empty,
+        remembered_targets: std.ArrayListUnmanaged(*Header) = .empty,
+        remember_lock: std.atomic.Value(u32) = .init(0),
+        nursery_force_full: std.atomic.Value(bool) = .init(false),
         /// True between `startMarking` and `finishMarking`: an incremental mark
         /// is in progress and the mutator runs between `markStep`s. While set,
         /// the insertion `writeBarrier` shades stored-into cells grey, and freshly
@@ -132,6 +148,7 @@ pub fn Heap(comptime Binding: type) type {
         addr_index_built: bool = false,
 
         const AddrEntry = struct { start: usize, end: usize, header: *Header };
+        const CollectionKind = enum { full, minor };
 
         pub const Visitor = struct {
             heap: *Self,
@@ -148,6 +165,7 @@ pub fn Heap(comptime Binding: type) type {
                 const p = cell orelse return;
                 const h = Self.headerOf(p);
                 if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
+                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &h.young, .monotonic)) return;
                 if (!v.heap.claimMark(h)) return; // already grey/black
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
@@ -174,8 +192,8 @@ pub fn Heap(comptime Binding: type) type {
             /// Used by ephemeron tables: if the key is live, the value is a
             /// strong edge; if the key stays white, the entry is weak.
             pub fn isMarked(v: *Visitor, cell: ?*anyopaque) bool {
-                _ = v;
                 const p = cell orelse return false;
+                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &Self.headerOf(p).young, .monotonic)) return true;
                 // Atomic: the parallel marker reads `marked` (here, in the sweep
                 // phase, and in conservative marking) while a mutator's `claimMark`
                 // write barrier CASes it (`.acq_rel`); a plain read races that. A
@@ -191,6 +209,7 @@ pub fn Heap(comptime Binding: type) type {
             /// teaching the collector about their frame layout.
             pub fn markConservativeWord(v: *Visitor, word: usize) void {
                 const h = v.heap.headerForInteriorAddress(word) orelse return;
+                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &h.young, .monotonic)) return;
                 // `claimMark` is the atomic CAS under a concurrent/parallel mark
                 // (and a plain check otherwise), so a conservative root claim
                 // can't race a peer mutator's `writeBarrier` claim on the same
@@ -266,6 +285,15 @@ pub fn Heap(comptime Binding: type) type {
             self.parallel = parallel;
         }
 
+        /// Enable the non-moving one-cycle nursery. New cells are young; a minor
+        /// collection reclaims unreachable young cells and immediately tenures
+        /// every survivor. Existing cells stay old, so enabling this after heap
+        /// initialization is safe.
+        pub fn setNurseryEnabled(self: *Self, enabled: bool) void {
+            std.debug.assert(!self.marking.load(.acquire));
+            self.nursery_enabled = enabled;
+        }
+
         fn headerOf(payload: *anyopaque) *Header {
             const raw: [*]u8 = @ptrCast(payload);
             return @ptrCast(@alignCast(raw - header_stride));
@@ -292,8 +320,8 @@ pub fn Heap(comptime Binding: type) type {
         /// that a concurrent mutator append could dangle by reallocating the
         /// buffer it points into. Call only with marks still valid (before sweep).
         pub fn isLive(self: *Self, p: ?*anyopaque) bool {
-            _ = self;
             const ptr = p orelse return false;
+            if (self.collection_kind == .minor and !@atomicLoad(bool, &headerOf(ptr).young, .monotonic)) return true;
             return @atomicLoad(bool, &headerOf(ptr).marked, .monotonic); // vs concurrent claimMark CAS
         }
 
@@ -388,9 +416,16 @@ pub fn Heap(comptime Binding: type) type {
             h.size = @sizeOf(T);
             h.kind = kind;
             @atomicStore(bool, &h.marked, born_grey, .release);
+            @atomicStore(bool, &h.young, self.nursery_enabled, .release);
+            @atomicStore(bool, &h.remembered_owner, false, .release);
+            @atomicStore(bool, &h.remembered_target, false, .release);
             self.all = h;
             self.live_cells += 1;
             self.bytes_live += total;
+            if (self.nursery_enabled) {
+                self.young_cells += 1;
+                self.young_bytes += total;
+            }
             if (born_grey) {
                 if (self.concurrent.load(.acquire)) {
                     // Allocated on the mutator thread during a concurrent mark.
@@ -416,7 +451,11 @@ pub fn Heap(comptime Binding: type) type {
         /// Collect if the heap has grown past the threshold. Call at safepoints
         /// (the engine's `(steps & 1023)` checkpoints) and after large allocs.
         pub fn maybeCollect(self: *Self) void {
-            if (self.bytes_live >= self.threshold_bytes) self.collect();
+            if (self.nursery_enabled and self.shouldCollectYoung()) {
+                self.collectYoung();
+            } else if (self.bytes_live >= self.threshold_bytes) {
+                self.collect();
+            }
         }
 
         /// Dijkstra insertion write barrier. The embedder calls this whenever it
@@ -427,6 +466,71 @@ pub fn Heap(comptime Binding: type) type {
         /// managed payload (the embedder may store non-cell pointers) — so it is
         /// cheap and safe to call broadly. Idempotent (already-grey/black: skip).
         pub fn writeBarrier(self: *Self, cell: ?*anyopaque) void {
+            self.rememberStrongStore(null, cell);
+            self.incrementalBarrier(cell);
+        }
+
+        /// Owner-aware insertion barrier. In nursery mode an old `owner` is
+        /// remembered when it receives a young child, so minor collection only
+        /// rescans dirty old containers. The incremental/full barrier remains
+        /// identical to `writeBarrier`.
+        pub fn writeBarrierFrom(self: *Self, owner: ?*anyopaque, cell: ?*anyopaque) void {
+            self.rememberStrongStore(owner, cell);
+            self.incrementalBarrier(cell);
+        }
+
+        /// Remember an old container whose weak slots changed. This does not mark
+        /// the weak target; it merely ensures minor GC revisits the container to
+        /// apply normal weak/ephemeron semantics.
+        pub fn writeBarrierWeak(self: *Self, owner: ?*anyopaque) void {
+            if (!self.nursery_enabled) return;
+            const p = owner orelse {
+                self.nursery_force_full.store(true, .release);
+                return;
+            };
+            const h = Self.headerOf(p);
+            if (h.magic != header_magic) {
+                self.nursery_force_full.store(true, .release);
+                return;
+            }
+            if (!@atomicLoad(bool, &h.young, .acquire)) self.rememberOwner(h);
+        }
+
+        fn rememberStrongStore(self: *Self, owner: ?*anyopaque, cell: ?*anyopaque) void {
+            if (!self.nursery_enabled) return;
+            const child_ptr = cell orelse return;
+            const child = Self.headerOf(child_ptr);
+            if (child.magic != header_magic or !@atomicLoad(bool, &child.young, .acquire)) return;
+            if (owner) |owner_ptr| {
+                const parent = Self.headerOf(owner_ptr);
+                if (parent.magic == header_magic) {
+                    if (!@atomicLoad(bool, &parent.young, .acquire)) self.rememberOwner(parent);
+                    return;
+                }
+            }
+            // Compatibility path for embedders that only provide the child. It
+            // is conservative but sound: retain that target for this nursery
+            // cycle, then tenure it and discard the entry.
+            if (@cmpxchgStrong(bool, &child.remembered_target, false, true, .acq_rel, .monotonic) != null) return;
+            self.lockRemember();
+            self.remembered_targets.append(self.aux, child) catch {
+                @atomicStore(bool, &child.remembered_target, false, .release);
+                self.nursery_force_full.store(true, .release);
+            };
+            self.unlockRemember();
+        }
+
+        fn rememberOwner(self: *Self, h: *Header) void {
+            if (@cmpxchgStrong(bool, &h.remembered_owner, false, true, .acq_rel, .monotonic) != null) return;
+            self.lockRemember();
+            self.remembered_owners.append(self.aux, h) catch {
+                @atomicStore(bool, &h.remembered_owner, false, .release);
+                self.nursery_force_full.store(true, .release);
+            };
+            self.unlockRemember();
+        }
+
+        fn incrementalBarrier(self: *Self, cell: ?*anyopaque) void {
             if (!self.marking.load(.acquire)) return;
             const p = cell orelse return;
             const h = Self.headerOf(p);
@@ -476,6 +580,13 @@ pub fn Heap(comptime Binding: type) type {
             self.barrier_lock.store(0, .release);
         }
 
+        inline fn lockRemember(self: *Self) void {
+            while (self.remember_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        }
+        inline fn unlockRemember(self: *Self) void {
+            self.remember_lock.store(0, .release);
+        }
+
         inline fn lockAlloc(self: *Self) void {
             while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
         }
@@ -486,6 +597,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Begin an incremental mark: whiten all cells and grey the roots. The
         /// mutator then runs between `markStep`s with the `writeBarrier` active.
         pub fn startMarking(self: *Self) void {
+            self.collection_kind = .full;
             var it = self.all;
             while (it) |h| : (it = h.next) h.marked = false;
             self.marked_count = 0;
@@ -552,6 +664,48 @@ pub fn Heap(comptime Binding: type) type {
             self.finishMarking();
         }
 
+        /// Run a stop-the-world nursery cycle. Old roots are not recursively
+        /// rescanned; dirty old containers and conservative child-only barrier
+        /// targets supply the old-to-young frontier. Every live young cell is
+        /// tenured, so the nursery is empty when this returns.
+        pub fn collectYoung(self: *Self) void {
+            std.debug.assert(!self.marking.load(.acquire));
+            std.debug.assert(!self.concurrent.load(.acquire));
+            if (!self.nursery_enabled or self.young_cells == 0) return;
+            if (self.nursery_force_full.load(.acquire)) {
+                self.collect();
+                return;
+            }
+
+            if (self.parallel) self.lockAlloc();
+            self.collection_kind = .minor;
+            var it = self.all;
+            while (it) |h| : (it = h.next) {
+                if (@atomicLoad(bool, &h.young, .monotonic)) @atomicStore(bool, &h.marked, false, .monotonic);
+            }
+            self.marked_count = 0;
+            self.mark_stack.clearRetainingCapacity();
+            self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch {};
+            self.weak_slots.clearRetainingCapacity();
+            self.addr_index_built = false;
+            self.marking.store(true, .release);
+            if (self.parallel) self.unlockAlloc();
+
+            var v = Visitor{ .heap = self };
+            Binding.traceRoots(self.ctx, &v);
+            self.lockRemember();
+            for (self.remembered_owners.items) |h| {
+                if (h.magic == header_magic and !@atomicLoad(bool, &h.young, .monotonic))
+                    Binding.trace(payloadOf(h), h.kind, &v);
+            }
+            for (self.remembered_targets.items) |h| v.mark(payloadOf(h));
+            self.unlockRemember();
+            while (self.mark_stack.pop()) |h| Binding.trace(payloadOf(h), h.kind, &v);
+            self.marking.store(false, .release);
+            self.sweepPhase(&v);
+            self.collection_kind = .full;
+        }
+
         // ---- Concurrent marking (M3) -------------------------------------
         //
         // The marker runs on its own thread while mutators keep executing. The
@@ -611,6 +765,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Requires `parallel`.
         pub fn beginConcurrentMarkParallel(self: *Self) void {
             std.debug.assert(self.parallel);
+            self.collection_kind = .full;
             self.lockAlloc();
             var it = self.all;
             // Atomic store: a lagging peer's `claimMark` CAS (barrier path, no
@@ -790,6 +945,17 @@ pub fn Heap(comptime Binding: type) type {
             return self.bytes_live >= self.threshold_bytes;
         }
 
+        /// Whether the nursery has reached its collection threshold, or a
+        /// remembered-set allocation failure requires the next nursery request
+        /// to fall back to a full collection.
+        pub fn shouldCollectYoung(self: *Self) bool {
+            if (!self.nursery_enabled) return false;
+            if (self.nursery_force_full.load(.acquire)) return true;
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            return self.young_bytes >= self.nursery_threshold_bytes;
+        }
+
         /// Abort an in-progress parallel concurrent mark WITHOUT sweeping: clear
         /// the marking state and the scratch buffers, freeing nothing. Sound at
         /// any time — an aborted mark just leaves some cells marked (re-whitened
@@ -832,6 +998,14 @@ pub fn Heap(comptime Binding: type) type {
         /// `parallel` (the parallel finish holds it across its born-empty check
         /// and the sweep so no cell is born in between).
         fn sweepPhaseLocked(self: *Self, v: *Visitor) void {
+            // Full marking does not consume the generational frontier. Drop its
+            // pre-mark snapshot before freeing anything: unlike minor GC, a full
+            // sweep may reclaim remembered owners/targets, so clearing their bits
+            // afterward would dereference dead headers. Parallel mutators can add
+            // fresh entries after this point; closure guarantees those cells are
+            // marked, and the final clear below safely discards those late cards.
+            if (self.collection_kind == .full) self.clearRemembered();
+
             // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
             // marked key, its value becomes strong. Iterate to a fixed point so
             // values can keep further keys alive through chains of weak maps.
@@ -840,7 +1014,7 @@ pub fn Heap(comptime Binding: type) type {
                     const before = self.marked_count;
                     var eit = self.all;
                     while (eit) |h| : (eit = h.next) {
-                        if (@atomicLoad(bool, &h.marked, .monotonic)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
+                        if (self.shouldProcessMarkedCell(h)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
                     }
                     while (self.mark_stack.pop()) |h| {
                         Binding.trace(payloadOf(h), h.kind, v);
@@ -853,23 +1027,37 @@ pub fn Heap(comptime Binding: type) type {
             //    frees it, so no slot ever dangles.
             for (self.weak_slots.items) |slot| {
                 if (slot.*) |target| {
-                    if (!@atomicLoad(bool, &headerOf(target).marked, .monotonic)) slot.* = null;
+                    if (!self.isLive(target)) slot.* = null;
                 }
             }
 
             if (@hasDecl(Binding, "afterWeak")) {
                 var wit = self.all;
                 while (wit) |h| : (wit = h.next) {
-                    if (@atomicLoad(bool, &h.marked, .monotonic)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
+                    if (self.shouldProcessMarkedCell(h)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
                 }
             }
 
             // 4. sweep the white cells.
+            const minor = self.collection_kind == .minor;
+            var cycle_promoted_cells: usize = 0;
+            var cycle_promoted_bytes: usize = 0;
             var prev: ?*Header = null;
             var cur = self.all;
             while (cur) |h| {
                 const next = h.next;
-                if (@atomicLoad(bool, &h.marked, .monotonic)) {
+                const young = @atomicLoad(bool, &h.young, .monotonic);
+                if (minor and !young) {
+                    prev = h;
+                } else if (@atomicLoad(bool, &h.marked, .monotonic)) {
+                    if (young) {
+                        const total = header_stride + h.size;
+                        @atomicStore(bool, &h.young, false, .release);
+                        self.young_cells -= 1;
+                        self.young_bytes -= total;
+                        cycle_promoted_cells += 1;
+                        cycle_promoted_bytes += total;
+                    }
                     prev = h;
                 } else {
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
@@ -877,6 +1065,10 @@ pub fn Heap(comptime Binding: type) type {
                     const total = header_stride + h.size;
                     self.live_cells -= 1;
                     self.bytes_live -= total;
+                    if (young) {
+                        self.young_cells -= 1;
+                        self.young_bytes -= total;
+                    }
                     const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
                     self.backing.free(base[0..total]);
                 }
@@ -884,7 +1076,32 @@ pub fn Heap(comptime Binding: type) type {
             }
 
             self.collections += 1;
-            self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
+            self.promoted_cells += cycle_promoted_cells;
+            self.promoted_bytes += cycle_promoted_bytes;
+            if (minor) {
+                self.minor_collections += 1;
+                self.nursery_threshold_bytes = @max(64 * 1024, cycle_promoted_bytes * 2);
+            } else {
+                self.full_collections += 1;
+                self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
+            }
+            self.clearRemembered();
+            self.nursery_force_full.store(false, .release);
+        }
+
+        fn shouldProcessMarkedCell(self: *Self, h: *Header) bool {
+            if (self.collection_kind == .full) return @atomicLoad(bool, &h.marked, .monotonic);
+            if (@atomicLoad(bool, &h.young, .monotonic)) return @atomicLoad(bool, &h.marked, .monotonic);
+            return @atomicLoad(bool, &h.remembered_owner, .monotonic);
+        }
+
+        fn clearRemembered(self: *Self) void {
+            self.lockRemember();
+            for (self.remembered_owners.items) |h| @atomicStore(bool, &h.remembered_owner, false, .release);
+            for (self.remembered_targets.items) |h| @atomicStore(bool, &h.remembered_target, false, .release);
+            self.remembered_owners.clearRetainingCapacity();
+            self.remembered_targets.clearRetainingCapacity();
+            self.unlockRemember();
         }
 
         fn deinitImpl(self: *Self, free_cell_storage: bool) void {
@@ -902,12 +1119,16 @@ pub fn Heap(comptime Binding: type) type {
             self.all = null;
             self.live_cells = 0;
             self.bytes_live = 0;
+            self.young_cells = 0;
+            self.young_bytes = 0;
             self.mark_stack.deinit(self.aux);
             self.weak_slots.deinit(self.backing);
             self.addr_index.deinit(self.backing);
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
             self.deferred_trace.deinit(self.aux);
+            self.remembered_owners.deinit(self.aux);
+            self.remembered_targets.deinit(self.aux);
         }
 
         /// Free every remaining cell (finalizing each) and the internal lists.
@@ -1098,6 +1319,110 @@ test "bulk deinit finalizes cells without individual backing frees" {
     try std.testing.expectEqual(@as(usize, 0), counting.free_calls);
 }
 
+test "nursery reclaims young garbage and tenures root survivors" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const live = try heap.create(TestRT.Node, .node);
+    live.* = .{ .id = 1 };
+    const garbage = try heap.create(TestRT.Node, .node);
+    garbage.* = .{ .id = 2 };
+    try rt.roots.append(a, live);
+
+    try std.testing.expectEqual(@as(usize, 2), heap.young_cells);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(usize, 1), heap.promoted_cells);
+    try std.testing.expectEqual(@as(usize, 1), heap.minor_collections);
+    try std.testing.expectEqual(@as(usize, 0), heap.full_collections);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
+test "nursery owner barrier preserves old-to-young edges" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const owner = try heap.create(TestRT.Node, .node);
+    owner.* = .{ .id = 1 };
+    try rt.roots.append(a, owner);
+    heap.collectYoung();
+
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    owner.strong = child;
+    heap.writeBarrierFrom(owner, child);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    owner.strong = null;
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
+test "nursery weak barrier clears an old container's dead young target" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const owner = try heap.create(TestRT.Node, .node);
+    owner.* = .{ .id = 1 };
+    try rt.roots.append(a, owner);
+    heap.collectYoung();
+
+    const target = try heap.create(TestRT.Node, .node);
+    target.* = .{ .id = 2 };
+    owner.weak = target;
+    heap.writeBarrierWeak(owner);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(?*anyopaque, null), owner.weak);
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
+test "nursery child-only barrier is a conservative compatibility root" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 1 };
+    heap.writeBarrier(child);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+}
+
 test "mark-sweep: optional conservative words root payload and interior pointers" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -1241,6 +1566,46 @@ test "mark-sweep: ephemeron values stay live only while keys are live" {
     heap.collect();
     try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
+}
+
+test "nursery ephemerons retain young values only for live keys" {
+    const a = std.testing.allocator;
+    var rt = EphRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(EphRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const key = try heap.create(EphRT.Node, .node);
+    key.* = .{ .id = 1 };
+    const table = try heap.create(EphRT.Table, .table);
+    table.* = .{};
+    try rt.roots.append(a, table);
+    try rt.roots.append(a, key);
+    heap.collectYoung(); // establish old table + old live key
+
+    const value = try heap.create(EphRT.Node, .node);
+    value.* = .{ .id = 2 };
+    const dead_key = try heap.create(EphRT.Node, .node);
+    dead_key.* = .{ .id = 3 };
+    const dead_value = try heap.create(EphRT.Node, .node);
+    dead_value.* = .{ .id = 4 };
+    try table.entries.append(a, .{ .key = key, .value = value });
+    try table.entries.append(a, .{ .key = dead_key, .value = dead_value });
+    heap.writeBarrierWeak(table);
+    heap.writeBarrierFrom(table, value);
+    heap.writeBarrierFrom(table, dead_value);
+
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(key, table.entries.items[0].key.?);
+    try std.testing.expectEqual(value, table.entries.items[0].value.?);
+    try std.testing.expectEqual(@as(usize, 2), rt.finalized.items.len);
 }
 
 test "incremental mark: stepped drain matches stop-the-world reachability" {
