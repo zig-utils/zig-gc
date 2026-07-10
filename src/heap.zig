@@ -559,22 +559,20 @@ pub fn Heap(comptime Binding: type) type {
                 self.nursery_force_full.store(true, .release);
                 return;
             };
-            const h = Self.headerOf(p);
-            if (h.magic != header_magic) {
+            const h = self.headerForPayload(p) orelse {
                 self.nursery_force_full.store(true, .release);
                 return;
-            }
+            };
             if (!@atomicLoad(bool, &h.young, .acquire)) self.rememberOwner(h);
         }
 
         fn rememberStrongStore(self: *Self, owner: ?*anyopaque, cell: ?*anyopaque) void {
             if (!self.nursery_enabled) return;
             const child_ptr = cell orelse return;
-            const child = Self.headerOf(child_ptr);
-            if (child.magic != header_magic or !@atomicLoad(bool, &child.young, .acquire)) return;
+            const child = self.headerForPayload(child_ptr) orelse return;
+            if (!@atomicLoad(bool, &child.young, .acquire)) return;
             if (owner) |owner_ptr| {
-                const parent = Self.headerOf(owner_ptr);
-                if (parent.magic == header_magic) {
+                if (self.headerForPayload(owner_ptr)) |parent| {
                     if (!@atomicLoad(bool, &parent.young, .acquire)) self.rememberOwner(parent);
                     return;
                 }
@@ -604,8 +602,7 @@ pub fn Heap(comptime Binding: type) type {
         fn incrementalBarrier(self: *Self, cell: ?*anyopaque) void {
             if (!self.marking.load(.acquire)) return;
             const p = cell orelse return;
-            const h = Self.headerOf(p);
-            if (h.magic != header_magic) return;
+            const h = self.headerForPayload(p) orelse return;
             if (!self.claimMark(h)) return;
             if (self.concurrent.load(.acquire)) {
                 // Hand the greyed cell to the marker thread (it owns mark_stack).
@@ -1560,6 +1557,38 @@ test "nursery child-only barrier is a conservative compatibility root" {
     try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
     heap.collect();
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+}
+
+test "write barriers tolerate non-heap pointer values" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    var stack_value: usize = 0;
+    const stack_ptr: *anyopaque = @ptrCast(&stack_value);
+    const wild: *anyopaque = @ptrFromInt(@as(usize, 0x1000_0000_0000));
+
+    // Nursery compatibility paths: maybe-managed child/owner pointers must be
+    // rejected by heap membership, not by peeking at their candidate headers.
+    heap.writeBarrier(stack_ptr);
+    heap.writeBarrier(wild);
+    heap.writeBarrierFrom(stack_ptr, wild);
+    heap.writeBarrierFrom(wild, stack_ptr);
+    heap.writeBarrierWeak(stack_ptr);
+    heap.writeBarrierWeak(wild);
+
+    // Incremental/concurrent barrier paths have the same public contract.
+    heap.marking.store(true, .release);
+    defer heap.marking.store(false, .release);
+    heap.writeBarrier(stack_ptr);
+    heap.writeBarrier(wild);
+    heap.writeBarrierFrom(stack_ptr, wild);
+    heap.writeBarrierFrom(wild, stack_ptr);
 }
 
 test "mark-sweep: optional conservative words root payload and interior pointers" {
