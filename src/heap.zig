@@ -887,17 +887,16 @@ pub fn Heap(comptime Binding: type) type {
             self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
         }
 
-        /// Free every remaining cell (finalizing each) and the internal lists.
-        /// The embedder calls this at context teardown — equivalent to the old
-        /// arena `deinit`, but finalizers run.
-        pub fn deinit(self: *Self) void {
+        fn deinitImpl(self: *Self, free_cell_storage: bool) void {
             var cur = self.all;
             while (cur) |h| {
                 const next = h.next;
                 Binding.finalize(self.ctx, payloadOf(h), h.kind);
-                const total = header_stride + h.size;
-                const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
-                self.backing.free(base[0..total]);
+                if (free_cell_storage) {
+                    const total = header_stride + h.size;
+                    const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
+                    self.backing.free(base[0..total]);
+                }
                 cur = next;
             }
             self.all = null;
@@ -909,6 +908,22 @@ pub fn Heap(comptime Binding: type) type {
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
             self.deferred_trace.deinit(self.aux);
+        }
+
+        /// Free every remaining cell (finalizing each) and the internal lists.
+        /// The embedder calls this at context teardown — equivalent to the old
+        /// arena `deinit`, but finalizers run.
+        pub fn deinit(self: *Self) void {
+            self.deinitImpl(true);
+        }
+
+        /// Finalize every remaining cell and release collector side buffers, but
+        /// do not return individual cell allocations to `backing`. Use only when
+        /// the embedder owns those allocations through a slab/arena that it will
+        /// reclaim wholesale immediately afterward. Cell finalizers still run in
+        /// full, so side storage and host resources are released normally.
+        pub fn deinitRetainingCellStorage(self: *Self) void {
+            self.deinitImpl(false);
         }
     };
 }
@@ -962,6 +977,43 @@ const TestRT = struct {
                 self.finalized.append(std.testing.allocator, n.id) catch {};
             },
         }
+    }
+};
+
+const FreeCountingAllocator = struct {
+    inner: std.mem.Allocator,
+    free_calls: usize = 0,
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.alloc(self.inner.ptr, len, alignment, ret_addr);
+    }
+
+    fn resizeFn(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.resize(self.inner.ptr, mem, alignment, new_len, ret_addr);
+    }
+
+    fn remapFn(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.remap(self.inner.ptr, mem, alignment, new_len, ret_addr);
+    }
+
+    fn freeFn(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
+        self.free_calls += 1;
+        self.inner.vtable.free(self.inner.ptr, mem, alignment, ret_addr);
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    fn allocator(self: *FreeCountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
     }
 };
 
@@ -1021,6 +1073,29 @@ test "deinit finalizes every remaining cell" {
 
     heap.deinit(); // no roots → everything is garbage, all finalized
     try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
+}
+
+test "bulk deinit finalizes cells without individual backing frees" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var counting = FreeCountingAllocator{ .inner = arena_state.allocator() };
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(counting.allocator(), &rt);
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        const n = try heap.create(TestRT.Node, .node);
+        n.* = .{ .id = i };
+    }
+
+    heap.deinitRetainingCellStorage();
+    try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.bytes_live);
+    try std.testing.expectEqual(@as(usize, 0), counting.free_calls);
 }
 
 test "mark-sweep: optional conservative words root payload and interior pointers" {
