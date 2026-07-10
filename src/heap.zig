@@ -118,6 +118,12 @@ pub fn Heap(comptime Binding: type) type {
         ctx: *Binding,
         /// Intrusive singly-linked list of every live cell (sweep walks it).
         all: ?*Header = null,
+        /// Exact live-payload index for broad "maybe managed" barrier/root
+        /// inputs. The all-list remains authoritative; this map is a fast path
+        /// maintained under `alloc_lock` alongside `all`. If it ever cannot grow,
+        /// lookup falls back to the all-list walk, preserving the same safety
+        /// semantics for wild/stale pointers.
+        payload_index: std.AutoHashMapUnmanaged(usize, *Header) = .empty,
         live_cells: usize = 0,
         bytes_live: usize = 0,
         /// Collect when `bytes_live` crosses this; reset to 2× live after a
@@ -373,14 +379,31 @@ pub fn Heap(comptime Binding: type) type {
             return @ptrCast(raw + header_stride);
         }
 
-        fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
-            if (self.parallel) self.lockAlloc();
-            defer if (self.parallel) self.unlockAlloc();
+        fn payloadKey(payload: *anyopaque) usize {
+            return @intFromPtr(payload);
+        }
+
+        fn headerForPayloadSlowLocked(self: *Self, payload: *anyopaque) ?*Header {
             var it = self.all;
             while (it) |h| : (it = h.next) {
                 if (payloadOf(h) == payload) return h;
             }
             return null;
+        }
+
+        fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            if (self.payload_index.get(payloadKey(payload))) |h| return h;
+            return self.headerForPayloadSlowLocked(payload);
+        }
+
+        fn indexPayloadLocked(self: *Self, h: *Header) void {
+            self.payload_index.put(self.backing, payloadKey(payloadOf(h)), h) catch {};
+        }
+
+        fn unindexPayloadLocked(self: *Self, h: *Header) void {
+            _ = self.payload_index.remove(payloadKey(payloadOf(h)));
         }
 
         /// Whether `p` is a live (marked) cell — O(1). `p` must be null or a
@@ -491,6 +514,7 @@ pub fn Heap(comptime Binding: type) type {
             @atomicStore(bool, &h.remembered_owner, false, .release);
             @atomicStore(bool, &h.remembered_target, false, .release);
             self.all = h;
+            self.indexPayloadLocked(h);
             self.live_cells += 1;
             self.bytes_live += total;
             if (self.nursery_enabled) {
@@ -1186,6 +1210,7 @@ pub fn Heap(comptime Binding: type) type {
                     prev = h;
                 } else {
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
+                    self.unindexPayloadLocked(h);
                     if (prev) |p| p.next = next else self.all = next;
                     self.live_cells -= 1;
                     self.bytes_live -= total;
@@ -1245,6 +1270,8 @@ pub fn Heap(comptime Binding: type) type {
                 cur = next;
             }
             self.all = null;
+            self.payload_index.deinit(self.backing);
+            self.payload_index = .empty;
             self.live_cells = 0;
             self.bytes_live = 0;
             self.young_cells = 0;
@@ -1332,6 +1359,8 @@ const TestRT = struct {
 const FreeCountingAllocator = struct {
     inner: std.mem.Allocator,
     free_calls: usize = 0,
+    watched_free_len: ?usize = null,
+    watched_free_calls: usize = 0,
 
     fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
@@ -1351,6 +1380,7 @@ const FreeCountingAllocator = struct {
     fn freeFn(ctx: *anyopaque, mem: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *FreeCountingAllocator = @ptrCast(@alignCast(ctx));
         self.free_calls += 1;
+        if (self.watched_free_len == mem.len) self.watched_free_calls += 1;
         self.inner.vtable.free(self.inner.ptr, mem, alignment, ret_addr);
     }
 
@@ -1426,14 +1456,18 @@ test "deinit finalizes every remaining cell" {
 
 test "bulk deinit finalizes cells without individual backing frees" {
     const a = std.testing.allocator;
+    const H = Heap(TestRT);
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    var counting = FreeCountingAllocator{ .inner = arena_state.allocator() };
+    var counting = FreeCountingAllocator{
+        .inner = arena_state.allocator(),
+        .watched_free_len = H.header_stride + @sizeOf(TestRT.Node),
+    };
     var rt = TestRT{};
     defer rt.roots.deinit(a);
     defer rt.finalized.deinit(a);
 
-    var heap = Heap(TestRT).init(counting.allocator(), &rt);
+    var heap = H.init(counting.allocator(), &rt);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
         const n = try heap.create(TestRT.Node, .node);
@@ -1444,7 +1478,7 @@ test "bulk deinit finalizes cells without individual backing frees" {
     try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 0), heap.bytes_live);
-    try std.testing.expectEqual(@as(usize, 0), counting.free_calls);
+    try std.testing.expectEqual(@as(usize, 0), counting.watched_free_calls);
 }
 
 test "nursery reclaims young garbage and tenures root survivors" {
