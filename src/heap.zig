@@ -957,6 +957,17 @@ pub fn Heap(comptime Binding: type) type {
             return self.bytes_live >= self.threshold_bytes;
         }
 
+        /// Whether tenured bytes alone have crossed the full-heap threshold.
+        /// Generational embedders use this at quiescent boundaries so a large
+        /// young batch receives a minor collection before it can force a full
+        /// trace. Mid-script collectors that cannot run minor GC should continue
+        /// using `shouldCollect()` over total bytes.
+        pub fn shouldCollectOld(self: *Self) bool {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            return self.bytes_live - self.young_bytes >= self.threshold_bytes;
+        }
+
         /// Whether the nursery has reached its collection threshold, or a
         /// remembered-set allocation failure requires the next nursery request
         /// to fall back to a full collection.
@@ -1356,6 +1367,8 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(@as(usize, 1), heap.minor_collections);
     try std.testing.expectEqual(@as(usize, 0), heap.full_collections);
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+    heap.threshold_bytes = 1;
+    try std.testing.expect(heap.shouldCollectOld());
 }
 
 test "nursery owner barrier preserves old-to-young edges" {
