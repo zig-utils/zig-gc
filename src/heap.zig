@@ -17,6 +17,7 @@
 //! Optional hooks:
 //!   fn traceEphemeron(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
 //!   fn afterWeak(ctx: *B, cell: *anyopaque, kind: Kind) void;
+//!   fn traceOldOnMinor(kind: Kind) bool;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -693,6 +694,17 @@ pub fn Heap(comptime Binding: type) type {
 
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
+            // Bindings may identify mutable side-cell kinds whose post-creation
+            // stores are not fully owner-barriered. Treat those old cells as
+            // remembered owners for this cycle. The sweep already walks `all`,
+            // so this adds only a kind check per old cell and traces edges solely
+            // for the selected kinds.
+            if (@hasDecl(Binding, "traceOldOnMinor")) {
+                var old_it = self.all;
+                while (old_it) |h| : (old_it = h.next) {
+                    if (!@atomicLoad(bool, &h.young, .monotonic) and Binding.traceOldOnMinor(h.kind)) self.rememberOwner(h);
+                }
+            }
             self.lockRemember();
             for (self.remembered_owners.items) |h| {
                 if (h.magic == header_magic and !@atomicLoad(bool, &h.young, .monotonic))
@@ -1472,6 +1484,10 @@ const EphRT = struct {
         for (self.roots.items) |r| v.mark(r);
     }
 
+    pub fn traceOldOnMinor(kind: Kind) bool {
+        return kind == .table;
+    }
+
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
         switch (kind) {
             .node => {
@@ -1568,7 +1584,7 @@ test "mark-sweep: ephemeron values stay live only while keys are live" {
     try std.testing.expectEqual(@as(usize, 0), table.entries.items.len);
 }
 
-test "nursery ephemerons retain young values only for live keys" {
+test "nursery binding-selected old ephemerons retain values only for live keys" {
     const a = std.testing.allocator;
     var rt = EphRT{};
     defer rt.roots.deinit(a);
@@ -1594,10 +1610,6 @@ test "nursery ephemerons retain young values only for live keys" {
     dead_value.* = .{ .id = 4 };
     try table.entries.append(a, .{ .key = key, .value = value });
     try table.entries.append(a, .{ .key = dead_key, .value = dead_value });
-    heap.writeBarrierWeak(table);
-    heap.writeBarrierFrom(table, value);
-    heap.writeBarrierFrom(table, dead_value);
-
     heap.collectYoung();
 
     try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
