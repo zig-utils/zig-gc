@@ -75,6 +75,7 @@ pub fn Heap(comptime Binding: type) type {
         threshold_bytes: usize = 64 * 1024,
         mark_stack: std.ArrayListUnmanaged(*Header) = .empty,
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
+        weak_lock: std.atomic.Value(u32) = .init(0),
         marked_count: usize = 0,
         collections: usize = 0,
         full_collections: usize = 0,
@@ -265,6 +266,8 @@ pub fn Heap(comptime Binding: type) type {
             /// Register a weak slot. After marking completes, if its target
             /// stayed white the slot is set to null (the cell is dying).
             pub fn markWeak(v: *Visitor, slot: *?*anyopaque) void {
+                v.heap.lockWeak();
+                defer v.heap.unlockWeak();
                 v.heap.weak_slots.append(v.heap.backing, slot) catch {
                     v.oom = true;
                 };
@@ -605,6 +608,13 @@ pub fn Heap(comptime Binding: type) type {
             self.remember_lock.store(0, .release);
         }
 
+        inline fn lockWeak(self: *Self) void {
+            while (self.weak_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        }
+        inline fn unlockWeak(self: *Self) void {
+            self.weak_lock.store(0, .release);
+        }
+
         inline fn lockAlloc(self: *Self) void {
             while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
         }
@@ -631,7 +641,9 @@ pub fn Heap(comptime Binding: type) type {
             // even the initial root push is covered. Cells born during the cycle
             // are folded in at the world-stopped finish, where a grow is safe.
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
             var v = Visitor{ .heap = self };
@@ -704,7 +716,9 @@ pub fn Heap(comptime Binding: type) type {
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch {};
+            self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
             if (self.parallel) self.unlockAlloc();
@@ -809,7 +823,9 @@ pub fn Heap(comptime Binding: type) type {
             // writes never reuse a page a mutator just freed from a side-store
             // mid-mark — the cross-thread allocator page-reuse TSan flags.
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.unlockWeak();
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
             self.deferred_trace.clearRetainingCapacity();
@@ -1065,11 +1081,13 @@ pub fn Heap(comptime Binding: type) type {
 
             // 3. weak edges whose target died are cleared *before* the sweep
             //    frees it, so no slot ever dangles.
+            self.lockWeak();
             for (self.weak_slots.items) |slot| {
                 if (slot.*) |target| {
                     if (!self.isLive(target)) slot.* = null;
                 }
             }
+            self.unlockWeak();
 
             if (@hasDecl(Binding, "afterWeak")) {
                 var wit = self.all;
