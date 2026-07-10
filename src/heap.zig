@@ -312,7 +312,7 @@ pub fn Heap(comptime Binding: type) type {
             pub fn markWeak(v: *Visitor, slot: *?*anyopaque) void {
                 v.heap.lockWeak();
                 defer v.heap.unlockWeak();
-                v.heap.weak_slots.append(v.heap.backing, slot) catch {
+                v.heap.weak_slots.append(v.heap.aux, slot) catch {
                     v.oom = true;
                 };
             }
@@ -1230,7 +1230,7 @@ pub fn Heap(comptime Binding: type) type {
             self.young_cells = 0;
             self.young_bytes = 0;
             self.mark_stack.deinit(self.aux);
-            self.weak_slots.deinit(self.backing);
+            self.weak_slots.deinit(self.aux);
             self.addr_index.deinit(self.backing);
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
