@@ -70,6 +70,12 @@ const WeakLock = if (use_pthread_weak_lock) struct {
     inline fn deinit(_: *@This()) void {}
 };
 
+// Weak-slot tracing is collector scratch state, not heap policy. Serialize it
+// with one process-wide lock so independent heaps created/destroyed on parallel
+// threads do not expose allocator address reuse to ThreadSanitizer as two
+// different per-heap mutexes protecting the same scratch page.
+var global_weak_lock: WeakLock = .{};
+
 pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
@@ -119,7 +125,6 @@ pub fn Heap(comptime Binding: type) type {
         threshold_bytes: usize = 64 * 1024,
         mark_stack: std.ArrayListUnmanaged(*Header) = .empty,
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
-        weak_lock: WeakLock = .{},
         marked_count: usize = 0,
         collections: usize = 0,
         full_collections: usize = 0,
@@ -653,10 +658,12 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         inline fn lockWeak(self: *Self) void {
-            self.weak_lock.lock();
+            _ = self;
+            global_weak_lock.lock();
         }
         inline fn unlockWeak(self: *Self) void {
-            self.weak_lock.unlock();
+            _ = self;
+            global_weak_lock.unlock();
         }
 
         inline fn lockAlloc(self: *Self) void {
@@ -1237,7 +1244,6 @@ pub fn Heap(comptime Binding: type) type {
             self.deferred_trace.deinit(self.aux);
             self.remembered_owners.deinit(self.aux);
             self.remembered_targets.deinit(self.aux);
-            self.weak_lock.deinit();
         }
 
         /// Free every remaining cell (finalizing each) and the internal lists.
