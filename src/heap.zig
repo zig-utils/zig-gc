@@ -25,6 +25,50 @@
 //! WeakMap-style key/value edges.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+const use_pthread_weak_lock = switch (builtin.os.tag) {
+    .linux,
+    .macos,
+    .ios,
+    .tvos,
+    .watchos,
+    .visionos,
+    .freebsd,
+    .netbsd,
+    .openbsd,
+    .dragonfly,
+    => true,
+    else => false,
+};
+
+const WeakLock = if (use_pthread_weak_lock) struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    inline fn lock(self: *@This()) void {
+        std.debug.assert(std.c.pthread_mutex_lock(&self.mutex) == .SUCCESS);
+    }
+
+    inline fn unlock(self: *@This()) void {
+        std.debug.assert(std.c.pthread_mutex_unlock(&self.mutex) == .SUCCESS);
+    }
+
+    inline fn deinit(self: *@This()) void {
+        std.debug.assert(std.c.pthread_mutex_destroy(&self.mutex) == .SUCCESS);
+    }
+} else struct {
+    state: std.atomic.Value(u32) = .init(0),
+
+    inline fn lock(self: *@This()) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    inline fn unlock(self: *@This()) void {
+        self.state.store(0, .release);
+    }
+
+    inline fn deinit(_: *@This()) void {}
+};
 
 pub fn Heap(comptime Binding: type) type {
     return struct {
@@ -75,7 +119,7 @@ pub fn Heap(comptime Binding: type) type {
         threshold_bytes: usize = 64 * 1024,
         mark_stack: std.ArrayListUnmanaged(*Header) = .empty,
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
-        weak_lock: std.atomic.Value(u32) = .init(0),
+        weak_lock: WeakLock = .{},
         marked_count: usize = 0,
         collections: usize = 0,
         full_collections: usize = 0,
@@ -609,10 +653,10 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         inline fn lockWeak(self: *Self) void {
-            while (self.weak_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            self.weak_lock.lock();
         }
         inline fn unlockWeak(self: *Self) void {
-            self.weak_lock.store(0, .release);
+            self.weak_lock.unlock();
         }
 
         inline fn lockAlloc(self: *Self) void {
@@ -1193,6 +1237,7 @@ pub fn Heap(comptime Binding: type) type {
             self.deferred_trace.deinit(self.aux);
             self.remembered_owners.deinit(self.aux);
             self.remembered_targets.deinit(self.aux);
+            self.weak_lock.deinit();
         }
 
         /// Free every remaining cell (finalizing each) and the internal lists.
