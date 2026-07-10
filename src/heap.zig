@@ -30,6 +30,8 @@ pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
         pub const Kind = Binding.Kind;
+        pub const min_nursery_threshold_bytes: usize = 64 * 1024;
+        pub const default_nursery_threshold_bytes: usize = 256 * 1024;
 
         /// One machine-word-ish header in front of every cell: the all-cells
         /// list link, the payload size (to free), the kind tag (to dispatch
@@ -81,7 +83,10 @@ pub fn Heap(comptime Binding: type) type {
         promoted_bytes: usize = 0,
         young_cells: usize = 0,
         young_bytes: usize = 0,
-        nursery_threshold_bytes: usize = 256 * 1024,
+        last_minor_young_bytes: usize = 0,
+        last_minor_reclaimed_bytes: usize = 0,
+        last_minor_promoted_bytes: usize = 0,
+        nursery_threshold_bytes: usize = default_nursery_threshold_bytes,
         nursery_enabled: bool = false,
         collection_kind: CollectionKind = .full,
         remembered_owners: std.ArrayListUnmanaged(*Header) = .empty,
@@ -293,6 +298,18 @@ pub fn Heap(comptime Binding: type) type {
         pub fn setNurseryEnabled(self: *Self, enabled: bool) void {
             std.debug.assert(!self.marking.load(.acquire));
             self.nursery_enabled = enabled;
+        }
+
+        fn doubledBytes(bytes: usize) usize {
+            const max = std.math.maxInt(usize);
+            if (bytes > max / 2) return max;
+            return bytes * 2;
+        }
+
+        fn nextNurseryThreshold(self: *Self, promoted_bytes: usize) usize {
+            const promoted_target = @max(min_nursery_threshold_bytes, doubledBytes(promoted_bytes));
+            const decay_floor = @max(min_nursery_threshold_bytes, self.nursery_threshold_bytes / 2);
+            return @max(promoted_target, decay_floor);
         }
 
         fn headerOf(payload: *anyopaque) *Header {
@@ -1063,6 +1080,8 @@ pub fn Heap(comptime Binding: type) type {
 
             // 4. sweep the white cells.
             const minor = self.collection_kind == .minor;
+            var cycle_young_bytes: usize = 0;
+            var cycle_reclaimed_young_bytes: usize = 0;
             var cycle_promoted_cells: usize = 0;
             var cycle_promoted_bytes: usize = 0;
             var prev: ?*Header = null;
@@ -1070,11 +1089,12 @@ pub fn Heap(comptime Binding: type) type {
             while (cur) |h| {
                 const next = h.next;
                 const young = @atomicLoad(bool, &h.young, .monotonic);
+                const total = header_stride + h.size;
+                if (minor and young) cycle_young_bytes += total;
                 if (minor and !young) {
                     prev = h;
                 } else if (@atomicLoad(bool, &h.marked, .monotonic)) {
                     if (young) {
-                        const total = header_stride + h.size;
                         @atomicStore(bool, &h.young, false, .release);
                         self.young_cells -= 1;
                         self.young_bytes -= total;
@@ -1085,12 +1105,12 @@ pub fn Heap(comptime Binding: type) type {
                 } else {
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
                     if (prev) |p| p.next = next else self.all = next;
-                    const total = header_stride + h.size;
                     self.live_cells -= 1;
                     self.bytes_live -= total;
                     if (young) {
                         self.young_cells -= 1;
                         self.young_bytes -= total;
+                        cycle_reclaimed_young_bytes += total;
                     }
                     const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
                     self.backing.free(base[0..total]);
@@ -1103,7 +1123,10 @@ pub fn Heap(comptime Binding: type) type {
             self.promoted_bytes += cycle_promoted_bytes;
             if (minor) {
                 self.minor_collections += 1;
-                self.nursery_threshold_bytes = @max(64 * 1024, cycle_promoted_bytes * 2);
+                self.last_minor_young_bytes = cycle_young_bytes;
+                self.last_minor_reclaimed_bytes = cycle_reclaimed_young_bytes;
+                self.last_minor_promoted_bytes = cycle_promoted_bytes;
+                self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_promoted_bytes);
             } else {
                 self.full_collections += 1;
                 self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
@@ -1357,13 +1380,19 @@ test "nursery reclaims young garbage and tenures root survivors" {
     const garbage = try heap.create(TestRT.Node, .node);
     garbage.* = .{ .id = 2 };
     try rt.roots.append(a, live);
+    heap.nursery_threshold_bytes = 512 * 1024;
 
     try std.testing.expectEqual(@as(usize, 2), heap.young_cells);
+    const young_bytes_before = heap.young_bytes;
     heap.collectYoung();
 
     try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
     try std.testing.expectEqual(@as(usize, 1), heap.promoted_cells);
+    try std.testing.expectEqual(young_bytes_before, heap.last_minor_young_bytes);
+    try std.testing.expectEqual(young_bytes_before / 2, heap.last_minor_promoted_bytes);
+    try std.testing.expectEqual(young_bytes_before / 2, heap.last_minor_reclaimed_bytes);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), heap.nursery_threshold_bytes);
     try std.testing.expectEqual(@as(usize, 1), heap.minor_collections);
     try std.testing.expectEqual(@as(usize, 0), heap.full_collections);
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
