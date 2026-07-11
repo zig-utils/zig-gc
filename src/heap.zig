@@ -199,6 +199,13 @@ pub fn Heap(comptime Binding: type) type {
         /// default, and today's single-GIL'd-mutator model) → that bookkeeping is
         /// lock-free, so single-threaded allocation pays nothing.
         parallel: bool = false,
+        /// True when a dedicated marker thread can read allocation metadata
+        /// (`all`, `payload_index`, address snapshots) while the single mutator
+        /// keeps allocating. This is intentionally distinct from `parallel`:
+        /// there is still only one allocator-mutator, so the embedder must not
+        /// take the parallel finish/abort path merely to make marker lookups
+        /// TSan-clean.
+        concurrent_marker_metadata: bool = false,
         alloc_lock: std.atomic.Value(u32) = .init(0),
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
@@ -348,6 +355,13 @@ pub fn Heap(comptime Binding: type) type {
             self.parallel = parallel;
         }
 
+        /// Serialize allocation metadata against a single dedicated marker
+        /// thread. Use this for concurrent marking without enabling the
+        /// multi-mutator `parallel` collector protocol.
+        pub fn setConcurrentMarkerMetadata(self: *Self, enabled: bool) void {
+            self.concurrent_marker_metadata = enabled;
+        }
+
         /// Enable the non-moving one-cycle nursery. New cells are young; a minor
         /// collection reclaims unreachable young cells and immediately tenures
         /// every survivor. Existing cells stay old, so enabling this after heap
@@ -383,6 +397,10 @@ pub fn Heap(comptime Binding: type) type {
             return @intFromPtr(payload);
         }
 
+        fn syncAllocMetadata(self: *Self) bool {
+            return self.parallel or self.concurrent_marker_metadata;
+        }
+
         fn headerForPayloadSlowLocked(self: *Self, payload: *anyopaque) ?*Header {
             var it = self.all;
             while (it) |h| : (it = h.next) {
@@ -392,8 +410,8 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
-            if (self.parallel) self.lockAlloc();
-            defer if (self.parallel) self.unlockAlloc();
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
             if (self.payload_index.get(payloadKey(payload))) |h| return h;
             return self.headerForPayloadSlowLocked(payload);
         }
@@ -443,8 +461,8 @@ pub fn Heap(comptime Binding: type) type {
             // `create` (which prepends to `all`) can't race the walk. New cells
             // born after this snapshot aren't in the index — fine: they are born
             // marked, so a conservative pointer into one needs no index hit.
-            if (self.parallel) self.lockAlloc();
-            defer if (self.parallel) self.unlockAlloc();
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
             self.addr_index.clearRetainingCapacity();
             var it = self.all;
             while (it) |h| : (it = h.next) {
@@ -483,10 +501,11 @@ pub fn Heap(comptime Binding: type) type {
             const slab = try self.backing.alignedAlloc(u8, .@"16", total);
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
             // Shared-state bookkeeping (all-list prepend, counters, born-cell
-            // hand-off) is serialized across mutators in `parallel` mode; lock-free
-            // otherwise (single GIL'd mutator).
-            if (self.parallel) self.lockAlloc();
-            defer if (self.parallel) self.unlockAlloc();
+            // hand-off) is serialized across mutators in `parallel` mode and
+            // against a dedicated marker in single-mutator concurrent mode;
+            // otherwise it remains lock-free.
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
             // Allocate-grey during an incremental mark: a cell created while
             // marking is in progress is born marked AND queued for tracing, so it
             // survives this cycle and — crucially — its *creation-time* field
