@@ -471,7 +471,7 @@ pub fn Heap(comptime Binding: type) type {
                 // address can fall into; record at least one byte so an exact
                 // payload pointer still resolves.
                 const size = if (h.size == 0) 1 else h.size;
-                self.addr_index.append(self.backing, .{
+                self.addr_index.append(self.aux, .{
                     .start = start,
                     .end = start + size,
                     .header = h,
@@ -498,7 +498,14 @@ pub fn Heap(comptime Binding: type) type {
             const total = header_stride + @sizeOf(T);
             // The slab alloc happens before the lock: `backing` is thread-safe in
             // `parallel` mode, and `h` is private until linked into `all` below.
-            const slab = try self.backing.alignedAlloc(u8, .@"16", total);
+            const slab = self.backing.alignedAlloc(u8, .@"16", total) catch |err| blk: {
+                if (err == error.OutOfMemory and @hasDecl(Binding, "recoverAllocationFailure")) {
+                    if (Binding.recoverAllocationFailure(self.ctx)) {
+                        break :blk try self.backing.alignedAlloc(u8, .@"16", total);
+                    }
+                }
+                return err;
+            };
             const h: *Header = @ptrCast(@alignCast(slab.ptr));
             // Shared-state bookkeeping (all-list prepend, counters, born-cell
             // hand-off) is serialized across mutators in `parallel` mode and
@@ -1297,7 +1304,7 @@ pub fn Heap(comptime Binding: type) type {
             self.young_bytes = 0;
             self.mark_stack.deinit(self.aux);
             self.weak_slots.deinit(self.aux);
-            self.addr_index.deinit(self.backing);
+            self.addr_index.deinit(self.aux);
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
             self.deferred_trace.deinit(self.aux);
