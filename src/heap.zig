@@ -377,10 +377,17 @@ pub fn Heap(comptime Binding: type) type {
             return bytes * 2;
         }
 
-        fn nextNurseryThreshold(self: *Self, promoted_bytes: usize) usize {
+        fn nextNurseryThreshold(self: *Self, young_bytes: usize, promoted_bytes: usize) usize {
             const promoted_target = @max(min_nursery_threshold_bytes, doubledBytes(promoted_bytes));
             const decay_floor = @max(min_nursery_threshold_bytes, self.nursery_threshold_bytes / 2);
-            return @max(promoted_target, decay_floor);
+            const adaptive = @max(promoted_target, decay_floor);
+            // Decay remains gradual, but growth should not jump past the young
+            // batch that was just measured. Otherwise high-survival bursts can
+            // skip the next quiescent minor and carry a whole dead batch until a
+            // later boundary.
+            if (adaptive <= self.nursery_threshold_bytes or young_bytes == 0) return adaptive;
+            const observed_cap = @max(self.nursery_threshold_bytes, @max(min_nursery_threshold_bytes, young_bytes));
+            return @min(adaptive, observed_cap);
         }
 
         fn headerOf(payload: *anyopaque) *Header {
@@ -1259,7 +1266,7 @@ pub fn Heap(comptime Binding: type) type {
                 self.last_minor_young_bytes = cycle_young_bytes;
                 self.last_minor_reclaimed_bytes = cycle_reclaimed_young_bytes;
                 self.last_minor_promoted_bytes = cycle_promoted_bytes;
-                self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_promoted_bytes);
+                self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_young_bytes, cycle_promoted_bytes);
             } else {
                 self.full_collections += 1;
                 self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
@@ -1540,6 +1547,28 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
     heap.threshold_bytes = 1;
     try std.testing.expect(heap.shouldCollectOld());
+}
+
+test "nursery threshold growth is capped by observed young batch" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    heap.nursery_threshold_bytes = 256 * 1024;
+
+    try std.testing.expectEqual(
+        @as(usize, 640 * 1024),
+        heap.nextNurseryThreshold(640 * 1024, 512 * 1024),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 128 * 1024),
+        heap.nextNurseryThreshold(4 * 1024, 8 * 1024),
+    );
 }
 
 test "nursery owner barrier preserves old-to-young edges" {
