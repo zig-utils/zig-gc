@@ -82,6 +82,7 @@ pub fn Heap(comptime Binding: type) type {
         pub const Kind = Binding.Kind;
         pub const min_nursery_threshold_bytes: usize = 64 * 1024;
         pub const default_nursery_threshold_bytes: usize = 256 * 1024;
+        const min_retained_scratch_entries: usize = 4096;
 
         /// One machine-word-ish header in front of every cell: the all-cells
         /// list link, the payload size (to free), the kind tag (to dispatch
@@ -1273,6 +1274,7 @@ pub fn Heap(comptime Binding: type) type {
             }
             self.clearRemembered();
             self.nursery_force_full.store(false, .release);
+            self.trimCollectorScratch();
         }
 
         fn shouldProcessMarkedCell(self: *Self, h: *Header) bool {
@@ -1288,6 +1290,33 @@ pub fn Heap(comptime Binding: type) type {
             self.remembered_owners.clearRetainingCapacity();
             self.remembered_targets.clearRetainingCapacity();
             self.unlockRemember();
+        }
+
+        fn retainedScratchEntryLimit(self: *Self) usize {
+            const max = std.math.maxInt(usize);
+            const live_bound = if (self.live_cells > max / 2) max else self.live_cells * 2;
+            return @max(min_retained_scratch_entries, live_bound);
+        }
+
+        fn trimEmptyScratchList(self: *Self, comptime T: type, list: *std.ArrayListUnmanaged(T)) void {
+            if (list.items.len != 0) return;
+            if (list.capacity <= self.retainedScratchEntryLimit()) return;
+            list.clearAndFree(self.aux);
+        }
+
+        fn trimCollectorScratch(self: *Self) void {
+            self.trimEmptyScratchList(*Header, &self.mark_stack);
+            self.lockWeak();
+            self.weak_slots.clearRetainingCapacity();
+            self.trimEmptyScratchList(*?*anyopaque, &self.weak_slots);
+            self.unlockWeak();
+            self.lockRemember();
+            self.trimEmptyScratchList(*Header, &self.remembered_owners);
+            self.trimEmptyScratchList(*Header, &self.remembered_targets);
+            self.unlockRemember();
+            self.trimEmptyScratchList(*Header, &self.barrier_buf);
+            self.trimEmptyScratchList(*Header, &self.born_concurrent);
+            self.trimEmptyScratchList(*Header, &self.deferred_trace);
         }
 
         fn deinitImpl(self: *Self, free_cell_storage: bool) void {
@@ -1569,6 +1598,42 @@ test "nursery threshold growth is capped by observed young batch" {
         @as(usize, 128 * 1024),
         heap.nextNurseryThreshold(4 * 1024, 8 * 1024),
     );
+}
+
+test "collector scratch frees oversized empty buffers after spike" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    const H = Heap(TestRT);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+
+    const retained = H.min_retained_scratch_entries;
+    const oversized = retained + 1;
+    try heap.mark_stack.ensureTotalCapacityPrecise(a, oversized);
+    try heap.weak_slots.ensureTotalCapacityPrecise(a, oversized);
+    try heap.remembered_owners.ensureTotalCapacityPrecise(a, oversized);
+    try heap.remembered_targets.ensureTotalCapacityPrecise(a, oversized);
+    try heap.barrier_buf.ensureTotalCapacityPrecise(a, oversized);
+    try heap.born_concurrent.ensureTotalCapacityPrecise(a, oversized);
+    try heap.deferred_trace.ensureTotalCapacityPrecise(a, oversized);
+    heap.live_cells = 1;
+
+    heap.trimCollectorScratch();
+
+    try std.testing.expectEqual(@as(usize, 0), heap.mark_stack.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.weak_slots.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.remembered_owners.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.remembered_targets.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.barrier_buf.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.born_concurrent.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.deferred_trace.capacity);
+
+    try heap.mark_stack.ensureTotalCapacityPrecise(a, retained);
+    heap.trimCollectorScratch();
+    try std.testing.expectEqual(retained, heap.mark_stack.capacity);
 }
 
 test "nursery owner barrier preserves old-to-young edges" {
