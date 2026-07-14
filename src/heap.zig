@@ -80,8 +80,8 @@ pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
         pub const Kind = Binding.Kind;
-        pub const min_nursery_threshold_bytes: usize = 64 * 1024;
-        pub const default_nursery_threshold_bytes: usize = 256 * 1024;
+        pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
+        pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         const min_retained_scratch_entries: usize = 4096;
 
         /// One machine-word-ish header in front of every cell: the all-cells
@@ -1614,7 +1614,7 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(young_bytes_before, heap.last_minor_young_bytes);
     try std.testing.expectEqual(young_bytes_before / 2, heap.last_minor_promoted_bytes);
     try std.testing.expectEqual(young_bytes_before / 2, heap.last_minor_reclaimed_bytes);
-    try std.testing.expectEqual(@as(usize, 256 * 1024), heap.nursery_threshold_bytes);
+    try std.testing.expectEqual(Heap(TestRT).min_nursery_threshold_bytes, heap.nursery_threshold_bytes);
     try std.testing.expectEqual(@as(usize, 1), heap.minor_collections);
     try std.testing.expectEqual(@as(usize, 0), heap.full_collections);
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
@@ -1632,15 +1632,15 @@ test "nursery threshold growth is capped by observed young batch" {
     defer heap.deinit();
     heap.setNurseryEnabled(true);
 
-    heap.nursery_threshold_bytes = 256 * 1024;
+    heap.nursery_threshold_bytes = 8 * 1024 * 1024;
 
     try std.testing.expectEqual(
-        @as(usize, 640 * 1024),
-        heap.nextNurseryThreshold(640 * 1024, 512 * 1024),
+        @as(usize, 12 * 1024 * 1024),
+        heap.nextNurseryThreshold(12 * 1024 * 1024, 8 * 1024 * 1024),
     );
     try std.testing.expectEqual(
-        @as(usize, 128 * 1024),
-        heap.nextNurseryThreshold(4 * 1024, 8 * 1024),
+        Heap(TestRT).min_nursery_threshold_bytes,
+        heap.nextNurseryThreshold(64 * 1024, 64 * 1024),
     );
 }
 
