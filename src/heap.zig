@@ -228,6 +228,11 @@ pub fn Heap(comptime Binding: type) type {
         /// TSan-clean.
         concurrent_marker_metadata: bool = false,
         alloc_lock: std.atomic.Value(u32) = .init(0),
+        /// Test-only telemetry used to prove batched publication acquires the
+        /// heap metadata lock once. The increment compiles out of release
+        /// builds; keeping the field unconditional avoids changing Self's type
+        /// between test declarations.
+        alloc_lock_acquisitions_for_testing: usize = 0,
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -586,15 +591,9 @@ pub fn Heap(comptime Binding: type) type {
             self.addr_index_built = true;
         }
 
-        /// Allocate a GC-managed cell of type `T` tagged `kind`. The returned
-        /// pointer is uninitialized payload; the caller writes it before the
-        /// next safepoint (so a collection never traces a half-built cell).
-        pub fn create(self: *Self, comptime T: type, kind: Kind) !*T {
-            comptime std.debug.assert(@alignOf(T) <= 16);
+        fn allocateCellSlab(self: *Self, comptime T: type) ![]align(16) u8 {
             const total = header_stride + @sizeOf(T);
-            // The slab alloc happens before the lock: `backing` is thread-safe in
-            // `parallel` mode, and `h` is private until linked into `all` below.
-            const slab = self.backing.alignedAlloc(u8, .@"16", total) catch |err| blk: {
+            return self.backing.alignedAlloc(u8, .@"16", total) catch |err| blk: {
                 if (err == error.OutOfMemory and @hasDecl(Binding, "recoverAllocationFailure")) {
                     if (Binding.recoverAllocationFailure(self.ctx)) {
                         break :blk try self.backing.alignedAlloc(u8, .@"16", total);
@@ -602,22 +601,18 @@ pub fn Heap(comptime Binding: type) type {
                 }
                 return err;
             };
-            const h: *Header = @ptrCast(@alignCast(slab.ptr));
-            // Shared-state bookkeeping (all-list prepend, counters, born-cell
-            // hand-off) is serialized across mutators in `parallel` mode and
-            // against a dedicated marker in single-mutator concurrent mode;
-            // otherwise it remains lock-free.
-            if (self.syncAllocMetadata()) self.lockAlloc();
-            defer if (self.syncAllocMetadata()) self.unlockAlloc();
-            // Allocate-grey during an incremental mark: a cell created while
-            // marking is in progress is born marked AND queued for tracing, so it
-            // survives this cycle and — crucially — its *creation-time* field
-            // writes are caught when it is traced (the caller fully initializes
-            // the payload before the next safepoint, where the next `markStep`
-            // runs). This is what lets the embedder barrier only post-creation
-            // mutations instead of every initializing store. Children added after
-            // it is traced are caught by the insertion `writeBarrier`.
-            const born_grey = self.marking.load(.acquire);
+        }
+
+        fn freePrivateCellSlab(self: *Self, comptime T: type, h: *Header) void {
+            const raw: [*]align(16) u8 = @ptrCast(@alignCast(h));
+            self.backing.free(raw[0..cellAllocationBytes(T)]);
+        }
+
+        /// Publish one privately allocated header. The caller serializes
+        /// allocation metadata when required and supplies one marking-state
+        /// snapshot for the complete publication batch.
+        fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool) *T {
+            const total = cellAllocationBytes(T);
             // Field-wise init (not a struct literal) so `marked` is written
             // *atomically*: under a parallel concurrent mark the marker may
             // `claimMark` this born-grey cell (an atomic CAS) the instant a peer
@@ -657,12 +652,65 @@ pub fn Heap(comptime Binding: type) type {
                     // just after abort/finish cleared `concurrent`. The cell is
                     // born marked but no collection is active enough to consume
                     // it; do not touch the marker-private stack from this thread.
-                    if (self.parallel) return @ptrCast(@alignCast(slab.ptr + header_stride));
-                    self.marked_count += 1;
-                    self.mark_stack.append(self.aux, h) catch {};
+                    if (!self.parallel) {
+                        self.marked_count += 1;
+                        self.mark_stack.append(self.aux, h) catch {};
+                    }
                 }
             }
-            return @ptrCast(@alignCast(slab.ptr + header_stride));
+            return @ptrCast(@alignCast(@as([*]u8, @ptrCast(h)) + header_stride));
+        }
+
+        /// Allocate a GC-managed cell of type `T` tagged `kind`. The returned
+        /// pointer is uninitialized payload; the caller writes it before the
+        /// next safepoint (so a collection never traces a half-built cell).
+        pub fn create(self: *Self, comptime T: type, kind: Kind) !*T {
+            comptime std.debug.assert(@alignOf(T) <= 16);
+            // The slab alloc happens before the lock: `backing` is thread-safe in
+            // `parallel` mode, and `h` is private until linked into `all` below.
+            const slab = try self.allocateCellSlab(T);
+            const h: *Header = @ptrCast(@alignCast(slab.ptr));
+            // Shared-state bookkeeping (all-list prepend, counters, born-cell
+            // hand-off) is serialized across mutators in `parallel` mode and
+            // against a dedicated marker in single-mutator concurrent mode;
+            // otherwise it remains lock-free.
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
+            // Allocate-grey during an incremental mark: a cell created while
+            // marking is in progress is born marked AND queued for tracing, so it
+            // survives this cycle and — crucially — its *creation-time* field
+            // writes are caught when it is traced (the caller fully initializes
+            // the payload before the next safepoint, where the next `markStep`
+            // runs). This is what lets the embedder barrier only post-creation
+            // mutations instead of every initializing store. Children added after
+            // it is traced are caught by the insertion `writeBarrier`.
+            return self.publishCellLocked(T, kind, h, self.marking.load(.acquire));
+        }
+
+        /// Allocate several same-kind cells privately, then publish all their
+        /// headers/list links/counters under one metadata lock. Every returned
+        /// payload is uninitialized and must be fully initialized before the
+        /// caller's next safepoint, just like `create`.
+        pub fn createBatch(self: *Self, comptime T: type, kind: Kind, out: []*T) !void {
+            comptime std.debug.assert(@alignOf(T) <= 16);
+            if (out.len == 0) return;
+
+            var allocated: usize = 0;
+            errdefer for (out[0..allocated]) |payload|
+                self.freePrivateCellSlab(T, headerOf(payload));
+            while (allocated < out.len) : (allocated += 1) {
+                const slab = try self.allocateCellSlab(T);
+                out[allocated] = @ptrCast(@alignCast(slab.ptr + header_stride));
+            }
+
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
+            const born_grey = self.marking.load(.acquire);
+            for (out) |payload| {
+                const h = headerOf(payload);
+                const published = self.publishCellLocked(T, kind, h, born_grey);
+                std.debug.assert(published == payload);
+            }
         }
 
         /// Collect if the heap has grown past the threshold. Call at safepoints
@@ -833,6 +881,7 @@ pub fn Heap(comptime Binding: type) type {
 
         inline fn lockAlloc(self: *Self) void {
             while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            if (builtin.is_test) self.alloc_lock_acquisitions_for_testing += 1;
         }
         inline fn unlockAlloc(self: *Self) void {
             self.alloc_lock.store(0, .release);
@@ -2613,6 +2662,95 @@ test "parallel: multiple mutators allocate concurrently without corrupting the h
     // a lost/double-linked prepend or a torn counter (the race a non-thread-safe
     // create would cause) would make these mismatch.
     try std.testing.expectEqual(@as(usize, threads * per), heap.live_cells);
+    var walked: usize = 0;
+    var it = heap.all;
+    while (it) |hdr| : (it = hdr.next) walked += 1;
+    try std.testing.expectEqual(@as(usize, threads * per), walked);
+}
+
+test "createBatch publishes nursery cells under one allocation lock" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setParallel(true);
+    heap.setNurseryEnabled(true);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    var nodes: [32]*N = undefined;
+    const locks_before = heap.alloc_lock_acquisitions_for_testing;
+    try heap.createBatch(N, .node, &nodes);
+    try std.testing.expectEqual(locks_before + 1, heap.alloc_lock_acquisitions_for_testing);
+    for (nodes, 0..) |node, i| node.* = .{ .id = @intCast(i) };
+
+    const bytes = nodes.len * Heap(TestRT).cellAllocationBytes(N);
+    try std.testing.expectEqual(nodes.len, heap.live_cells);
+    try std.testing.expectEqual(bytes, heap.bytes_live);
+    try std.testing.expectEqual(nodes.len, heap.young_cells);
+    try std.testing.expectEqual(bytes, heap.young_bytes);
+    var walked: usize = 0;
+    var it = heap.all;
+    while (it) |hdr| : (it = hdr.next) walked += 1;
+    try std.testing.expectEqual(nodes.len, walked);
+}
+
+test "createBatch frees private slabs when allocation fails before publication" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(failing.allocator(), &rt);
+    defer heap.deinit();
+    var nodes: [4]*TestRT.Node = undefined;
+    try std.testing.expectError(error.OutOfMemory, heap.createBatch(TestRT.Node, .node, &nodes));
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    try std.testing.expectEqual(@as(?*Heap(TestRT).Header, null), heap.all);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "parallel: batched mutators preserve the all-list and amortize publication locks" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(std.heap.page_allocator);
+    heap.backing = std.heap.page_allocator;
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const threads = 8;
+    const per = 2048;
+    const batch_size = 32;
+    const Worker = struct {
+        heap: *Heap(TestRT),
+        fn run(s: *@This()) void {
+            var created: usize = 0;
+            var nodes: [batch_size]*N = undefined;
+            while (created < per) {
+                const count = @min(batch_size, per - created);
+                s.heap.createBatch(N, .node, nodes[0..count]) catch return;
+                for (nodes[0..count], 0..) |node, i|
+                    node.* = .{ .id = @intCast(created + i) };
+                created += count;
+            }
+        }
+    };
+    var worker = Worker{ .heap = &heap };
+    var pool: [threads]std.Thread = undefined;
+    for (&pool) |*thread| thread.* = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    for (&pool) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, threads * per), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, threads * (per / batch_size)), heap.alloc_lock_acquisitions_for_testing);
     var walked: usize = 0;
     var it = heap.all;
     while (it) |hdr| : (it = hdr.next) walked += 1;
