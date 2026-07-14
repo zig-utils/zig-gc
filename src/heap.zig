@@ -20,7 +20,6 @@
 //!   fn traceOldOnMinor(kind: Kind) bool;
 //!   fn classifyConservativeInterior(ctx: *B, address: usize) InteriorOwnership;
 //!   fn allCellsUseOwnedStorage(ctx: *B) bool;
-//!   fn freeCellBatch(ctx: *B, allocations: []const CellAllocation) void;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -39,13 +38,6 @@ pub const InteriorOwnership = union(enum) {
     outside,
     owned_empty,
     allocation: *anyopaque,
-};
-
-/// One dead cell's exact backing allocation. Optional batch-free bindings must
-/// release every entry exactly once before returning.
-pub const CellAllocation = struct {
-    ptr: [*]align(16) u8,
-    len: usize,
 };
 
 const use_pthread_weak_lock = switch (builtin.os.tag) {
@@ -104,7 +96,6 @@ pub fn Heap(comptime Binding: type) type {
         pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         const min_retained_scratch_entries: usize = 4096;
-        const sweep_release_batch_size: usize = 64;
 
         /// One machine-word-ish header in front of every cell: the all-cells
         /// list link, the payload size (to free), the kind tag (to dispatch
@@ -1348,15 +1339,6 @@ pub fn Heap(comptime Binding: type) type {
             self.sweepPhaseLocked(v);
         }
 
-        fn releaseCellBatch(self: *Self, allocations: []const CellAllocation) void {
-            if (allocations.len == 0) return;
-            if (@hasDecl(Binding, "freeCellBatch")) {
-                self.ctx.freeCellBatch(allocations);
-            } else {
-                for (allocations) |allocation| self.backing.free(allocation.ptr[0..allocation.len]);
-            }
-        }
-
         /// The sweep tail proper, assuming `alloc_lock` is already held under
         /// `parallel` (the parallel finish holds it across its born-empty check
         /// and the sweep so no cell is born in between).
@@ -1409,8 +1391,6 @@ pub fn Heap(comptime Binding: type) type {
             var cycle_reclaimed_young_bytes: usize = 0;
             var cycle_promoted_cells: usize = 0;
             var cycle_promoted_bytes: usize = 0;
-            var release_batch: [sweep_release_batch_size]CellAllocation = undefined;
-            var release_count: usize = 0;
             var prev: ?*Header = null;
             var cur = self.all;
             while (cur) |h| {
@@ -1444,16 +1424,10 @@ pub fn Heap(comptime Binding: type) type {
                         cycle_reclaimed_young_bytes += total;
                     }
                     const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
-                    release_batch[release_count] = .{ .ptr = base, .len = total };
-                    release_count += 1;
-                    if (release_count == release_batch.len) {
-                        self.releaseCellBatch(&release_batch);
-                        release_count = 0;
-                    }
+                    self.backing.free(base[0..total]);
                 }
                 cur = next;
             }
-            self.releaseCellBatch(release_batch[0..release_count]);
 
             self.collections += 1;
             self.promoted_cells += cycle_promoted_cells;
@@ -1693,28 +1667,6 @@ const FreeCountingAllocator = struct {
     }
 };
 
-const BatchFreeTestRT = struct {
-    pub const Kind = enum { node };
-    const Node = struct { value: usize = 0 };
-
-    allocator: std.mem.Allocator,
-    finalized: usize = 0,
-    batch_calls: usize = 0,
-    released_cells: usize = 0,
-
-    pub fn traceRoots(_: *BatchFreeTestRT, _: anytype) void {}
-    pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
-    pub fn finalize(self: *BatchFreeTestRT, _: *anyopaque, _: Kind) void {
-        self.finalized += 1;
-    }
-    pub fn freeCellBatch(self: *BatchFreeTestRT, allocations: []const CellAllocation) void {
-        std.debug.assert(self.finalized >= self.released_cells + allocations.len);
-        self.batch_calls += 1;
-        self.released_cells += allocations.len;
-        for (allocations) |allocation| self.allocator.free(allocation.ptr[0..allocation.len]);
-    }
-};
-
 test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -1752,24 +1704,6 @@ test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear"
     heap.collect();
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 3), rt.finalized.items.len);
-}
-
-test "sweep batches finalized cell releases through an optional binding hook" {
-    const a = std.testing.allocator;
-    var rt = BatchFreeTestRT{ .allocator = a };
-    var heap = Heap(BatchFreeTestRT).init(a, &rt);
-    defer heap.deinit();
-
-    for (0..130) |i| {
-        const node = try heap.create(BatchFreeTestRT.Node, .node);
-        node.* = .{ .value = i };
-    }
-    heap.collect();
-
-    try std.testing.expectEqual(@as(usize, 130), rt.finalized);
-    try std.testing.expectEqual(@as(usize, 130), rt.released_cells);
-    try std.testing.expectEqual(@as(usize, 3), rt.batch_calls);
-    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
 }
 
 test "deinit finalizes every remaining cell" {
