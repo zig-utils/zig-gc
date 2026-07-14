@@ -386,10 +386,35 @@ pub fn Heap(comptime Binding: type) type {
         /// Enable the non-moving one-cycle nursery. New cells are young; a minor
         /// collection reclaims unreachable young cells and immediately tenures
         /// every survivor. Existing cells stay old, so enabling this after heap
-        /// initialization is safe.
+        /// initialization is safe. Disabling with a pending nursery tenures that
+        /// entire young prefix without collecting: later old allocations can
+        /// therefore never split the prefix before a re-enable.
         pub fn setNurseryEnabled(self: *Self, enabled: bool) void {
             std.debug.assert(!self.marking.load(.acquire));
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            if (!enabled and self.nursery_enabled and self.young_cells != 0)
+                self.tenureYoungPrefix();
             self.nursery_enabled = enabled;
+        }
+
+        fn tenureYoungPrefix(self: *Self) void {
+            var promoted_cells: usize = 0;
+            var promoted_bytes: usize = 0;
+            var it = self.all;
+            while (it) |h| {
+                if (!@atomicLoad(bool, &h.young, .monotonic)) break;
+                @atomicStore(bool, &h.young, false, .release);
+                promoted_cells += 1;
+                promoted_bytes += header_stride + h.size;
+                it = h.next;
+            }
+            std.debug.assert(promoted_cells == self.young_cells);
+            std.debug.assert(promoted_bytes == self.young_bytes);
+            self.young_cells = 0;
+            self.young_bytes = 0;
+            self.promoted_cells += promoted_cells;
+            self.promoted_bytes += promoted_bytes;
         }
 
         fn doubledBytes(bytes: usize) usize {
@@ -886,9 +911,11 @@ pub fn Heap(comptime Binding: type) type {
 
             if (self.parallel) self.lockAlloc();
             self.collection_kind = .minor;
-            var it = self.all;
-            while (it) |h| : (it = h.next) {
-                if (@atomicLoad(bool, &h.young, .monotonic)) @atomicStore(bool, &h.marked, false, .monotonic);
+            var old_head = self.all;
+            while (old_head) |h| {
+                if (!@atomicLoad(bool, &h.young, .monotonic)) break;
+                @atomicStore(bool, &h.marked, false, .monotonic);
+                old_head = h.next;
             }
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
@@ -912,9 +939,9 @@ pub fn Heap(comptime Binding: type) type {
             // so this adds only a kind check per old cell and traces edges solely
             // for the selected kinds.
             if (@hasDecl(Binding, "traceOldOnMinor")) {
-                var old_it = self.all;
+                var old_it = old_head;
                 while (old_it) |h| : (old_it = h.next) {
-                    if (!@atomicLoad(bool, &h.young, .monotonic) and Binding.traceOldOnMinor(h.kind)) self.rememberOwner(h);
+                    if (Binding.traceOldOnMinor(h.kind)) self.rememberOwner(h);
                 }
             }
             self.lockRemember();
@@ -1290,13 +1317,12 @@ pub fn Heap(comptime Binding: type) type {
             var prev: ?*Header = null;
             var cur = self.all;
             while (cur) |h| {
-                const next = h.next;
                 const young = @atomicLoad(bool, &h.young, .monotonic);
+                if (minor and !young) break;
+                const next = h.next;
                 const total = header_stride + h.size;
                 if (minor and young) cycle_young_bytes += total;
-                if (minor and !young) {
-                    prev = h;
-                } else if (@atomicLoad(bool, &h.marked, .monotonic)) {
+                if (@atomicLoad(bool, &h.marked, .monotonic)) {
                     if (young) {
                         @atomicStore(bool, &h.young, false, .release);
                         self.young_cells -= 1;
@@ -1682,6 +1708,73 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
     heap.threshold_bytes = 1;
     try std.testing.expect(heap.shouldCollectOld());
+}
+
+test "nursery disable tenures the pending prefix before old allocations" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const first = try heap.create(TestRT.Node, .node);
+    first.* = .{ .id = 1 };
+    const second = try heap.create(TestRT.Node, .node);
+    second.* = .{ .id = 2 };
+    const promoted_before = heap.promoted_cells;
+    heap.setNurseryEnabled(false);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(promoted_before + 2, heap.promoted_cells);
+
+    const old = try heap.create(TestRT.Node, .node);
+    old.* = .{ .id = 3 };
+    heap.setNurseryEnabled(true);
+    const live = try heap.create(TestRT.Node, .node);
+    live.* = .{ .id = 4 };
+    const garbage = try heap.create(TestRT.Node, .node);
+    garbage.* = .{ .id = 5 };
+    try rt.roots.append(a, live);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 4), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(u32, 5), rt.finalized.items[0]);
+}
+
+test "minor whitening and sweep stop at the old-generation boundary" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    const H = Heap(TestRT);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const old = try heap.create(TestRT.Node, .node);
+    old.* = .{ .id = 1 };
+    try rt.roots.append(a, old);
+    heap.collectYoung();
+
+    const live = try heap.create(TestRT.Node, .node);
+    live.* = .{ .id = 2 };
+    const garbage = try heap.create(TestRT.Node, .node);
+    garbage.* = .{ .id = 3 };
+    try rt.roots.append(a, live);
+
+    const old_header = H.headerOf(old);
+    const saved_next = old_header.next;
+    old_header.next = @ptrFromInt(@as(usize, 0x1000));
+    heap.collectYoung();
+    old_header.next = saved_next;
+
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
 }
 
 test "nursery threshold growth is capped by observed young batch" {
