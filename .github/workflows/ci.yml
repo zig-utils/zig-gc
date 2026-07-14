@@ -1,0 +1,41 @@
+name: CI
+
+# zig-gc is self-contained. Linux TSan is the race-detection gate for its
+# concurrent and parallel collector paths because the current macOS Zig
+# toolchain cannot build the bundled TSan runtime.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.956+2dca73595
+      - name: Unit tests
+        run: zig build test
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.956+2dca73595
+      - name: ThreadSanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          for i in $(seq 1 20); do
+            echo "=== zig-gc TSan iter $i ==="
+            zig build test -Dtsan=true
+          done
+          echo "no TSan race in 20 iterations"
