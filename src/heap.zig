@@ -405,6 +405,18 @@ pub fn Heap(comptime Binding: type) type {
             return @intFromPtr(payload);
         }
 
+        inline fn bindingOwnsCellAllocation(self: *Self, allocation: *anyopaque) bool {
+            if (@hasDecl(Binding, "ownsCellAllocation"))
+                return self.ctx.ownsCellAllocation(allocation);
+            return false;
+        }
+
+        inline fn bindingUsesOwnedCellStorage(self: *Self, total: usize) bool {
+            if (@hasDecl(Binding, "usesOwnedCellStorage"))
+                return self.ctx.usesOwnedCellStorage(total);
+            return false;
+        }
+
         fn syncAllocMetadata(self: *Self) bool {
             return self.parallel or self.concurrent_marker_metadata;
         }
@@ -420,15 +432,23 @@ pub fn Heap(comptime Binding: type) type {
         fn headerForPayload(self: *Self, payload: *anyopaque) ?*Header {
             if (self.syncAllocMetadata()) self.lockAlloc();
             defer if (self.syncAllocMetadata()) self.unlockAlloc();
+            const candidate = headerOf(payload);
+            // An embedder with exact slab ownership metadata can validate the
+            // candidate address before we dereference it. Header magic supplies
+            // liveness; the hash/list path remains authoritative otherwise.
+            if (self.bindingOwnsCellAllocation(@ptrCast(candidate)) and candidate.magic == header_magic)
+                return candidate;
             if (self.payload_index.get(payloadKey(payload))) |h| return h;
             return self.headerForPayloadSlowLocked(payload);
         }
 
         fn indexPayloadLocked(self: *Self, h: *Header) void {
+            if (self.bindingUsesOwnedCellStorage(header_stride + h.size)) return;
             self.payload_index.put(self.backing, payloadKey(payloadOf(h)), h) catch {};
         }
 
         fn unindexPayloadLocked(self: *Self, h: *Header) void {
+            if (self.bindingUsesOwnedCellStorage(header_stride + h.size)) return;
             _ = self.payload_index.remove(payloadKey(payloadOf(h)));
         }
 
@@ -1245,6 +1265,10 @@ pub fn Heap(comptime Binding: type) type {
                 } else {
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
                     self.unindexPayloadLocked(h);
+                    // Slab ownership outlives a freed slot. Clear the live-cell
+                    // witness before returning storage so a stale payload cannot
+                    // pass the optional ownership hook.
+                    h.magic = 0;
                     if (prev) |p| p.next = next else self.all = next;
                     self.live_cells -= 1;
                     self.bytes_live -= total;
@@ -1415,6 +1439,26 @@ const TestRT = struct {
                 self.finalized.append(std.testing.allocator, n.id) catch {};
             },
         }
+    }
+};
+
+const OwnedCellTestRT = struct {
+    pub const Kind = enum { node };
+    const Node = struct { value: u32 = 0 };
+
+    owned_header: ?*anyopaque = null,
+    live: bool = false,
+
+    pub fn traceRoots(_: *OwnedCellTestRT, _: anytype) void {}
+    pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
+    pub fn finalize(self: *OwnedCellTestRT, _: *anyopaque, _: Kind) void {
+        self.live = false;
+    }
+    pub fn usesOwnedCellStorage(_: *OwnedCellTestRT, _: usize) bool {
+        return true;
+    }
+    pub fn ownsCellAllocation(self: *OwnedCellTestRT, allocation: *anyopaque) bool {
+        return self.live and allocation == self.owned_header;
     }
 };
 
@@ -1792,6 +1836,25 @@ test "visitor isManaged tolerates non-heap pointer values" {
 
     const wild: *anyopaque = @ptrFromInt(@as(usize, 0x1000_0000_0000));
     try std.testing.expect(!visitor.isManaged(wild));
+}
+
+test "owned cell hook replaces the payload index and rejects stale cells" {
+    const H = Heap(OwnedCellTestRT);
+    var rt = OwnedCellTestRT{};
+    var heap = H.init(std.testing.allocator, &rt);
+    defer heap.deinit();
+
+    const live = try heap.create(OwnedCellTestRT.Node, .node);
+    live.* = .{ .value = 7 };
+    rt.owned_header = @ptrFromInt(@intFromPtr(live) - H.header_stride);
+    rt.live = true;
+
+    try std.testing.expectEqual(@as(usize, 0), heap.payload_index.count());
+    var visitor = H.Visitor{ .heap = &heap };
+    try std.testing.expect(visitor.isManaged(live));
+
+    heap.collect();
+    try std.testing.expect(!visitor.isManaged(live));
 }
 
 const EphRT = struct {

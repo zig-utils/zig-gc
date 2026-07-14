@@ -45,6 +45,22 @@ payload pointers keep the owning cell alive; unrelated words are ignored. This
 does not replace precise heap tracing — it is a stack-root escape hatch for
 runtimes whose frame layout is not fully described yet.
 
+An embedder with exact slab metadata may also replace the collector's per-cell
+live-payload hash for slab-owned allocations with two optional hooks:
+
+```zig
+fn usesOwnedCellStorage(ctx: *B, total: usize) bool;
+fn ownsCellAllocation(ctx: *B, allocation: *anyopaque) bool;
+```
+
+`usesOwnedCellStorage` must return `true` only when every successful aligned
+allocation of `total` bytes comes from storage covered by the ownership hook.
+`ownsCellAllocation` receives a candidate header address and must validate it
+without dereferencing unowned memory; it must accept only exact issued cell-slot
+starts. The collector checks its live header magic after ownership succeeds,
+clears that magic before freeing a cell, and retains the hash/all-cells fallback
+for other allocations and bindings without these hooks.
+
 ## Usage
 
 ```zig
