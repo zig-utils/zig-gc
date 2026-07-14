@@ -4,6 +4,7 @@
 
 pub const Heap = @import("heap.zig").Heap;
 pub const InteriorOwnership = @import("heap.zig").InteriorOwnership;
+pub const CellAllocation = @import("heap.zig").CellAllocation;
 
 test {
     _ = @import("heap.zig");
