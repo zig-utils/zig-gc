@@ -18,6 +18,8 @@
 //!   fn traceEphemeron(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
 //!   fn afterWeak(ctx: *B, cell: *anyopaque, kind: Kind) void;
 //!   fn traceOldOnMinor(kind: Kind) bool;
+//!   fn classifyConservativeInterior(ctx: *B, address: usize) InteriorOwnership;
+//!   fn allCellsUseOwnedStorage(ctx: *B) bool;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -26,6 +28,17 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+/// Optional binding result for conservative interior-address classification.
+/// `allocation` is the exact cell allocation base (the header address), while
+/// `owned_empty` means the address lies in owned storage but cannot name an
+/// issued allocation. `outside` permits the collector's generic fallback unless
+/// the binding separately proves that every cell uses its owned storage.
+pub const InteriorOwnership = union(enum) {
+    outside,
+    owned_empty,
+    allocation: *anyopaque,
+};
 
 const use_pthread_weak_lock = switch (builtin.os.tag) {
     .linux,
@@ -104,6 +117,13 @@ pub fn Heap(comptime Binding: type) type {
         /// correctly aligned, and `payload - header_stride` recovers the header
         /// in O(1) regardless of cell type.
         const header_stride = std.mem.alignForward(usize, @sizeOf(Header), 16);
+
+        /// Exact backing allocation size for a cell payload type. Embedders that
+        /// claim all cells use owned storage use this in an exhaustive comptime
+        /// proof over their cell taxonomy.
+        pub fn cellAllocationBytes(comptime T: type) usize {
+            return header_stride + @sizeOf(T);
+        }
 
         backing: std.mem.Allocator,
         /// Scratch allocator for the collector's own bookkeeping that the marker
@@ -417,6 +437,18 @@ pub fn Heap(comptime Binding: type) type {
             return false;
         }
 
+        inline fn bindingClassifyConservativeInterior(self: *Self, address: usize) ?InteriorOwnership {
+            if (@hasDecl(Binding, "classifyConservativeInterior"))
+                return self.ctx.classifyConservativeInterior(address);
+            return null;
+        }
+
+        inline fn bindingAllCellsUseOwnedStorage(self: *Self) bool {
+            if (@hasDecl(Binding, "allCellsUseOwnedStorage"))
+                return self.ctx.allCellsUseOwnedStorage();
+            return false;
+        }
+
         fn syncAllocMetadata(self: *Self) bool {
             return self.parallel or self.concurrent_marker_metadata;
         }
@@ -466,6 +498,17 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
+            if (self.bindingClassifyConservativeInterior(address)) |ownership| switch (ownership) {
+                .allocation => |base| {
+                    const h: *Header = @ptrCast(@alignCast(base));
+                    if (h.magic != header_magic) return null;
+                    const start = @intFromPtr(payloadOf(h));
+                    const size = if (h.size == 0) 1 else h.size;
+                    return if (address >= start and address < start + size) h else null;
+                },
+                .owned_empty => return null,
+                .outside => if (self.bindingAllCellsUseOwnedStorage()) return null,
+            };
             // Lazily build the address-sorted index on first use within a
             // collection (reset by `collect`). The mark phase never allocates or
             // frees cells, so a snapshot stays valid for the whole phase.
@@ -1447,9 +1490,16 @@ const OwnedCellTestRT = struct {
     const Node = struct { value: u32 = 0 };
 
     owned_header: ?*anyopaque = null,
+    owned_start: usize = 0,
+    owned_end: usize = 0,
+    owned_empty_address: usize = 0,
+    conservative_words: []const usize = &.{},
+    classify_calls: usize = 0,
     live: bool = false,
 
-    pub fn traceRoots(_: *OwnedCellTestRT, _: anytype) void {}
+    pub fn traceRoots(self: *OwnedCellTestRT, v: anytype) void {
+        for (self.conservative_words) |word| v.markConservativeWord(word);
+    }
     pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
     pub fn finalize(self: *OwnedCellTestRT, _: *anyopaque, _: Kind) void {
         self.live = false;
@@ -1459,6 +1509,18 @@ const OwnedCellTestRT = struct {
     }
     pub fn ownsCellAllocation(self: *OwnedCellTestRT, allocation: *anyopaque) bool {
         return self.live and allocation == self.owned_header;
+    }
+    pub fn classifyConservativeInterior(self: *OwnedCellTestRT, address: usize) InteriorOwnership {
+        self.classify_calls += 1;
+        if (address == self.owned_empty_address) return .owned_empty;
+        if (self.owned_header) |header| {
+            if (address >= self.owned_start and address < self.owned_end)
+                return .{ .allocation = header };
+        }
+        return .outside;
+    }
+    pub fn allCellsUseOwnedStorage(_: *OwnedCellTestRT) bool {
+        return true;
     }
 };
 
@@ -1855,6 +1917,38 @@ test "owned cell hook replaces the payload index and rejects stale cells" {
 
     heap.collect();
     try std.testing.expect(!visitor.isManaged(live));
+}
+
+test "owned conservative classification skips the generic address index" {
+    const H = Heap(OwnedCellTestRT);
+    var rt = OwnedCellTestRT{};
+    var heap = H.init(std.testing.allocator, &rt);
+    defer heap.deinit();
+
+    const live = try heap.create(OwnedCellTestRT.Node, .node);
+    live.* = .{ .value = 7 };
+    const header = @intFromPtr(live) - H.header_stride;
+    rt.owned_header = @ptrFromInt(header);
+    rt.owned_start = header;
+    rt.owned_end = header + H.cellAllocationBytes(OwnedCellTestRT.Node) + 16;
+    rt.owned_empty_address = 0x1111;
+    rt.live = true;
+
+    const words = [_]usize{
+        header,
+        @intFromPtr(live),
+        @intFromPtr(live) + 1,
+        @intFromPtr(live) + @sizeOf(OwnedCellTestRT.Node),
+        rt.owned_empty_address,
+        0x2222,
+    };
+    rt.conservative_words = &words;
+    heap.collect();
+
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expect(rt.classify_calls >= words.len);
+    try std.testing.expect(!heap.addr_index_built);
+    try std.testing.expectEqual(@as(usize, 0), heap.addr_index.items.len);
 }
 
 const EphRT = struct {

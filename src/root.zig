@@ -3,6 +3,7 @@
 //! zig-utils/zig-js `docs/threads/P7-gc-design.md`.
 
 pub const Heap = @import("heap.zig").Heap;
+pub const InteriorOwnership = @import("heap.zig").InteriorOwnership;
 
 test {
     _ = @import("heap.zig");
