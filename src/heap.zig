@@ -591,7 +591,7 @@ pub fn Heap(comptime Binding: type) type {
             self.addr_index_built = true;
         }
 
-        fn allocateCellSlab(self: *Self, comptime T: type) ![]align(16) u8 {
+        inline fn allocateCellSlab(self: *Self, comptime T: type) ![]align(16) u8 {
             const total = header_stride + @sizeOf(T);
             return self.backing.alignedAlloc(u8, .@"16", total) catch |err| blk: {
                 if (err == error.OutOfMemory and @hasDecl(Binding, "recoverAllocationFailure")) {
@@ -606,7 +606,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Publish one privately allocated header. The caller serializes
         /// allocation metadata when required and supplies one marking-state
         /// snapshot for the complete publication batch.
-        fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool) *T {
+        inline fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool) *T {
             const total = cellAllocationBytes(T);
             // Field-wise init (not a struct literal) so `marked` is written
             // *atomically*: under a parallel concurrent mark the marker may
