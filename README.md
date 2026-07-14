@@ -74,8 +74,8 @@ const obj = try heap.create(MyObject, .object); // uninitialized payload
 obj.* = .{ ... };                      // initialize before the next safepoint
 
 var objects: [32]*MyObject = undefined;
-try heap.createBatch(MyObject, .object, &objects); // one metadata publication lock
-for (objects) |item| item.* = .{ ... }; // initialize every item before a safepoint
+const count = try heap.createBatch(MyObject, .object, &objects); // one metadata lock
+for (objects[0..count]) |item| item.* = .{ ... }; // initialize before a safepoint
 
 heap.maybeCollect();                   // call at safepoints; collects past a threshold
 heap.collect();                        // or force a full stop-the-world cycle
@@ -86,7 +86,9 @@ before the next collection so a cycle never traces a half-built cell. Batched
 creation allocates private slabs first, then publishes their headers, all-cells
 links, nursery accounting, and born-grey state under one metadata lock. Cells
 are 16-byte aligned with a single-word header; recovering a header from a
-payload is O(1).
+payload is O(1). A short batch reports its successfully published prefix so the
+caller can commit that work before the next allocation performs recovery or
+reports OOM, preserving sequential failure ordering.
 
 ## Status
 

@@ -603,11 +603,6 @@ pub fn Heap(comptime Binding: type) type {
             };
         }
 
-        fn freePrivateCellSlab(self: *Self, comptime T: type, h: *Header) void {
-            const raw: [*]align(16) u8 = @ptrCast(@alignCast(h));
-            self.backing.free(raw[0..cellAllocationBytes(T)]);
-        }
-
         /// Publish one privately allocated header. The caller serializes
         /// allocation metadata when required and supplies one marking-state
         /// snapshot for the complete publication batch.
@@ -687,30 +682,42 @@ pub fn Heap(comptime Binding: type) type {
             return self.publishCellLocked(T, kind, h, self.marking.load(.acquire));
         }
 
-        /// Allocate several same-kind cells privately, then publish all their
-        /// headers/list links/counters under one metadata lock. Every returned
-        /// payload is uninitialized and must be fully initialized before the
-        /// caller's next safepoint, just like `create`.
-        pub fn createBatch(self: *Self, comptime T: type, kind: Kind, out: []*T) !void {
+        /// Allocate several same-kind cells privately, then publish the
+        /// successfully allocated prefix under one metadata lock. Returning a
+        /// short prefix defers recovery/OOM until the caller has initialized and
+        /// consumed those cells, preserving sequential allocation failure
+        /// ordering. Every returned payload is uninitialized and must be fully
+        /// initialized before the caller's next safepoint, just like `create`.
+        pub fn createBatch(self: *Self, comptime T: type, kind: Kind, out: []*T) !usize {
             comptime std.debug.assert(@alignOf(T) <= 16);
-            if (out.len == 0) return;
+            if (out.len == 0) return 0;
 
             var allocated: usize = 0;
-            errdefer for (out[0..allocated]) |payload|
-                self.freePrivateCellSlab(T, headerOf(payload));
-            while (allocated < out.len) : (allocated += 1) {
-                const slab = try self.allocateCellSlab(T);
+            while (allocated < out.len) {
+                // Only the first allocation uses recovery. If a later private
+                // slab fails, publish the successful prefix and let the caller
+                // commit its corresponding work before requesting another
+                // batch, at which point normal recovery/OOM ordering resumes.
+                const slab = self.backing.alignedAlloc(u8, .@"16", cellAllocationBytes(T)) catch {
+                    if (allocated != 0) break;
+                    const recovered = try self.allocateCellSlab(T);
+                    out[allocated] = @ptrCast(@alignCast(recovered.ptr + header_stride));
+                    allocated += 1;
+                    continue;
+                };
                 out[allocated] = @ptrCast(@alignCast(slab.ptr + header_stride));
+                allocated += 1;
             }
 
             if (self.syncAllocMetadata()) self.lockAlloc();
             defer if (self.syncAllocMetadata()) self.unlockAlloc();
             const born_grey = self.marking.load(.acquire);
-            for (out) |payload| {
+            for (out[0..allocated]) |payload| {
                 const h = headerOf(payload);
                 const published = self.publishCellLocked(T, kind, h, born_grey);
                 std.debug.assert(published == payload);
             }
+            return allocated;
         }
 
         /// Collect if the heap has grown past the threshold. Call at safepoints
@@ -2682,7 +2689,7 @@ test "createBatch publishes nursery cells under one allocation lock" {
     const N = TestRT.Node;
     var nodes: [32]*N = undefined;
     const locks_before = heap.alloc_lock_acquisitions_for_testing;
-    try heap.createBatch(N, .node, &nodes);
+    try std.testing.expectEqual(nodes.len, try heap.createBatch(N, .node, &nodes));
     try std.testing.expectEqual(locks_before + 1, heap.alloc_lock_acquisitions_for_testing);
     for (nodes, 0..) |node, i| node.* = .{ .id = @intCast(i) };
 
@@ -2697,7 +2704,7 @@ test "createBatch publishes nursery cells under one allocation lock" {
     try std.testing.expectEqual(nodes.len, walked);
 }
 
-test "createBatch frees private slabs when allocation fails before publication" {
+test "createBatch publishes a partial prefix before preserving OOM order" {
     const a = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 2 });
     var rt = TestRT{};
@@ -2705,11 +2712,14 @@ test "createBatch frees private slabs when allocation fails before publication" 
     defer rt.finalized.deinit(a);
 
     var heap = Heap(TestRT).init(failing.allocator(), &rt);
-    defer heap.deinit();
     var nodes: [4]*TestRT.Node = undefined;
-    try std.testing.expectError(error.OutOfMemory, heap.createBatch(TestRT.Node, .node, &nodes));
-    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
-    try std.testing.expectEqual(@as(?*Heap(TestRT).Header, null), heap.all);
+    const count = try heap.createBatch(TestRT.Node, .node, &nodes);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    for (nodes[0..count], 0..) |node, i| node.* = .{ .id = @intCast(i) };
+    try std.testing.expectEqual(count, heap.live_cells);
+    try std.testing.expectError(error.OutOfMemory, heap.createBatch(TestRT.Node, .node, nodes[count..]));
+    try std.testing.expectEqual(count, heap.live_cells);
+    heap.deinit();
     try std.testing.expectEqual(failing.allocations, failing.deallocations);
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
@@ -2737,10 +2747,10 @@ test "parallel: batched mutators preserve the all-list and amortize publication 
             var nodes: [batch_size]*N = undefined;
             while (created < per) {
                 const count = @min(batch_size, per - created);
-                s.heap.createBatch(N, .node, nodes[0..count]) catch return;
-                for (nodes[0..count], 0..) |node, i|
+                const published = s.heap.createBatch(N, .node, nodes[0..count]) catch return;
+                for (nodes[0..published], 0..) |node, i|
                     node.* = .{ .id = @intCast(created + i) };
-                created += count;
+                created += published;
             }
         }
     };
