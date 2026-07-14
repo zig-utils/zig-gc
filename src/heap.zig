@@ -696,6 +696,23 @@ pub fn Heap(comptime Binding: type) type {
             self.incrementalBarrier(cell);
         }
 
+        /// Fast owner-aware barrier for exact live managed payloads allocated by
+        /// this heap. Unlike `writeBarrierFrom`, this deliberately does not
+        /// classify arbitrary pointers through the live-payload index. The
+        /// caller must provide non-null payload starts from this heap; use the
+        /// tolerant barrier whenever either pointer may be external or stale.
+        pub fn writeBarrierFromManaged(self: *Self, owner: *anyopaque, cell: *anyopaque) void {
+            const child = headerOf(cell);
+            std.debug.assert(child.magic == header_magic);
+            if (self.nursery_enabled and @atomicLoad(bool, &child.young, .acquire)) {
+                const parent = headerOf(owner);
+                std.debug.assert(parent.magic == header_magic);
+                if (!@atomicLoad(bool, &parent.young, .acquire)) self.rememberOwner(parent);
+            }
+            if (!self.marking.load(.acquire)) return;
+            self.incrementalBarrierHeader(child);
+        }
+
         /// Remember an old container whose weak slots changed. This does not mark
         /// the weak target; it merely ensures minor GC revisits the container to
         /// apply normal weak/ephemeron semantics.
@@ -749,6 +766,10 @@ pub fn Heap(comptime Binding: type) type {
             if (!self.marking.load(.acquire)) return;
             const p = cell orelse return;
             const h = self.headerForPayload(p) orelse return;
+            self.incrementalBarrierHeader(h);
+        }
+
+        fn incrementalBarrierHeader(self: *Self, h: *Header) void {
             if (!self.claimMark(h)) return;
             if (self.concurrent.load(.acquire)) {
                 // Hand the greyed cell to the marker thread (it owns mark_stack).
@@ -1865,6 +1886,36 @@ test "nursery owner barrier preserves old-to-young edges" {
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
 }
 
+test "exact managed owner barrier preserves old-to-young edges" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const owner = try heap.create(TestRT.Node, .node);
+    owner.* = .{ .id = 1 };
+    try rt.roots.append(a, owner);
+    heap.collectYoung();
+
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    owner.strong = child;
+    heap.writeBarrierFromManaged(owner, child);
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    owner.strong = null;
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
 test "nursery weak barrier clears an old container's dead young target" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -2274,6 +2325,40 @@ test "incremental mark: insertion barrier saves a cell reparented behind a black
     try std.testing.expect(holder.strong == orphan);
     try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]); // donor
+}
+
+test "incremental mark: exact managed owner barrier preserves an inserted child" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const holder = try heap.create(N, .node);
+    holder.* = .{ .id = 1 };
+    const donor = try heap.create(N, .node);
+    donor.* = .{ .id = 2 };
+    const orphan = try heap.create(N, .node);
+    orphan.* = .{ .id = 3 };
+    donor.strong = orphan;
+    try rt.roots.append(a, holder);
+
+    heap.startMarking();
+    _ = heap.markStep(0);
+
+    holder.strong = orphan;
+    heap.writeBarrierFromManaged(holder, orphan);
+    donor.strong = null;
+
+    heap.finishMarking();
+
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expect(holder.strong == orphan);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
 }
 
 test "incremental mark: cells allocated mid-cycle are born grey and survive" {
