@@ -1420,6 +1420,8 @@ pub fn Heap(comptime Binding: type) type {
             const minor = self.collection_kind == .minor;
             var cycle_young_bytes: usize = 0;
             var cycle_reclaimed_young_bytes: usize = 0;
+            var cycle_reclaimed_cells: usize = 0;
+            var cycle_reclaimed_bytes: usize = 0;
             var cycle_promoted_cells: usize = 0;
             var cycle_promoted_bytes: usize = 0;
             const release_batch_capacity = 64;
@@ -1437,8 +1439,6 @@ pub fn Heap(comptime Binding: type) type {
                 if (@atomicLoad(bool, &h.marked, .monotonic)) {
                     if (young) {
                         @atomicStore(bool, &h.young, false, .release);
-                        self.young_cells -= 1;
-                        self.young_bytes -= total;
                         cycle_promoted_cells += 1;
                         cycle_promoted_bytes += total;
                     }
@@ -1451,11 +1451,9 @@ pub fn Heap(comptime Binding: type) type {
                     // pass the optional ownership hook.
                     h.magic = 0;
                     if (prev) |p| p.next = next else self.all = next;
-                    self.live_cells -= 1;
-                    self.bytes_live -= total;
+                    cycle_reclaimed_cells += 1;
+                    cycle_reclaimed_bytes += total;
                     if (young) {
-                        self.young_cells -= 1;
-                        self.young_bytes -= total;
                         cycle_reclaimed_young_bytes += total;
                     }
                     if (@hasDecl(Binding, "freeCellStorageBatch")) {
@@ -1479,6 +1477,21 @@ pub fn Heap(comptime Binding: type) type {
             }
             if (@hasDecl(Binding, "freeCellStorageBatch") and release_batch_len != 0)
                 Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, release_batch[0..release_batch_len]);
+
+            // Binding calls inside the sweep can otherwise force these hot
+            // heap fields to be reloaded and stored for every dead cell. The
+            // list/header mutations remain immediate; publish their exact
+            // aggregate accounting after every finalizer and backing release
+            // has completed.
+            std.debug.assert(self.live_cells >= cycle_reclaimed_cells);
+            std.debug.assert(self.bytes_live >= cycle_reclaimed_bytes);
+            self.live_cells -= cycle_reclaimed_cells;
+            self.bytes_live -= cycle_reclaimed_bytes;
+            // Every collection kind traverses the complete young prefix (a
+            // minor stops exactly at the old boundary; a full continues past
+            // it), and every marked young cell is tenured during that walk.
+            self.young_cells = 0;
+            self.young_bytes = 0;
 
             self.collections += 1;
             self.promoted_cells += cycle_promoted_cells;
