@@ -61,6 +61,18 @@ starts. The collector checks its live header magic after ownership succeeds,
 clears that magic before freeing a cell, and retains the hash/all-cells fallback
 for other allocations and bindings without these hooks.
 
+Embedders that can prove no weak semantic state has been published may avoid
+empty ephemeron, weak-slot, and after-weak passes with:
+
+```zig
+fn hasWeakWork(ctx: *B) bool;
+```
+
+Returning `false` is a correctness promise that the heap has no weak slots,
+ephemeron edges, or after-weak cleanup records. A monotonic false-to-true flag
+is sufficient and may conservatively remain true for the rest of the heap
+lifetime. Bindings without this hook always run the weak passes.
+
 An embedder whose backing allocator can reserve several equal-size slabs under
 one size-class lock may also provide:
 

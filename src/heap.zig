@@ -15,6 +15,7 @@
 //!   fn finalize(ctx: *B, cell: *anyopaque, kind: Kind) void; // a cell is dying
 //!
 //! Optional hooks:
+//!   fn hasWeakWork(ctx: *B) bool;
 //!   fn traceEphemeron(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
 //!   fn afterWeak(ctx: *B, cell: *anyopaque, kind: Kind) void;
 //!   fn traceOldOnMinor(kind: Kind) bool;
@@ -1372,37 +1373,45 @@ pub fn Heap(comptime Binding: type) type {
             // marked, and the final clear below safely discards those late cards.
             if (self.collection_kind == .full) self.clearRemembered();
 
-            // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
-            // marked key, its value becomes strong. Iterate to a fixed point so
-            // values can keep further keys alive through chains of weak maps.
-            if (@hasDecl(Binding, "traceEphemeron")) {
-                while (true) {
-                    const before = self.marked_count;
-                    var eit = self.all;
-                    while (eit) |h| : (eit = h.next) {
-                        if (self.shouldProcessMarkedCell(h)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
+            // A binding can conservatively prove that it has never published
+            // weak semantic state. In that common case all three passes below
+            // are empty, and avoiding their all-list walks is material for
+            // allocation-heavy nursery cycles. Bindings without the hook keep
+            // the original unconditional behavior.
+            const has_weak_work = if (@hasDecl(Binding, "hasWeakWork")) Binding.hasWeakWork(self.ctx) else true;
+            if (has_weak_work) {
+                // 2b. Ephemerons (WeakMap-style edges): if a marked table has a
+                // marked key, its value becomes strong. Iterate to a fixed point
+                // so values can keep further keys alive through weak-map chains.
+                if (@hasDecl(Binding, "traceEphemeron")) {
+                    while (true) {
+                        const before = self.marked_count;
+                        var eit = self.all;
+                        while (eit) |h| : (eit = h.next) {
+                            if (self.shouldProcessMarkedCell(h)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
+                        }
+                        while (self.mark_stack.pop()) |h| {
+                            Binding.trace(payloadOf(h), h.kind, v);
+                        }
+                        if (self.marked_count == before) break;
                     }
-                    while (self.mark_stack.pop()) |h| {
-                        Binding.trace(payloadOf(h), h.kind, v);
+                }
+
+                // 3. weak edges whose target died are cleared *before* the
+                // sweep frees it, so no slot ever dangles.
+                self.lockWeak();
+                for (self.weak_slots.items) |slot| {
+                    if (slot.*) |target| {
+                        if (!self.isLive(target)) slot.* = null;
                     }
-                    if (self.marked_count == before) break;
                 }
-            }
+                self.unlockWeak();
 
-            // 3. weak edges whose target died are cleared *before* the sweep
-            //    frees it, so no slot ever dangles.
-            self.lockWeak();
-            for (self.weak_slots.items) |slot| {
-                if (slot.*) |target| {
-                    if (!self.isLive(target)) slot.* = null;
-                }
-            }
-            self.unlockWeak();
-
-            if (@hasDecl(Binding, "afterWeak")) {
-                var wit = self.all;
-                while (wit) |h| : (wit = h.next) {
-                    if (self.shouldProcessMarkedCell(h)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
+                if (@hasDecl(Binding, "afterWeak")) {
+                    var wit = self.all;
+                    while (wit) |h| : (wit = h.next) {
+                        if (self.shouldProcessMarkedCell(h)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
+                    }
                 }
             }
 
@@ -2213,6 +2222,15 @@ const EphRT = struct {
 
     roots: std.ArrayListUnmanaged(*anyopaque) = .empty,
     finalized: std.ArrayListUnmanaged(u32) = .empty,
+    has_weak_work: bool = true,
+    weak_work_checks: usize = 0,
+    ephemeron_calls: usize = 0,
+    after_weak_calls: usize = 0,
+
+    pub fn hasWeakWork(self: *EphRT) bool {
+        self.weak_work_checks += 1;
+        return self.has_weak_work;
+    }
 
     pub fn traceRoots(self: *EphRT, v: anytype) void {
         for (self.roots.items) |r| v.mark(r);
@@ -2236,7 +2254,7 @@ const EphRT = struct {
     }
 
     pub fn traceEphemeron(self: *EphRT, cell: *anyopaque, kind: Kind, v: anytype) void {
-        _ = self;
+        self.ephemeron_calls += 1;
         switch (kind) {
             .node => {},
             .table => {
@@ -2249,7 +2267,7 @@ const EphRT = struct {
     }
 
     pub fn afterWeak(self: *EphRT, cell: *anyopaque, kind: Kind) void {
-        _ = self;
+        self.after_weak_calls += 1;
         switch (kind) {
             .node => {},
             .table => {
@@ -2279,6 +2297,30 @@ const EphRT = struct {
         }
     }
 };
+
+test "binding can skip weak passes until weak work exists" {
+    const a = std.testing.allocator;
+    var rt = EphRT{ .has_weak_work = false };
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(EphRT).init(a, &rt);
+    defer heap.deinit();
+    const node = try heap.create(EphRT.Node, .node);
+    node.* = .{ .id = 1 };
+    try rt.roots.append(a, node);
+
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), rt.weak_work_checks);
+    try std.testing.expectEqual(@as(usize, 0), rt.ephemeron_calls);
+    try std.testing.expectEqual(@as(usize, 0), rt.after_weak_calls);
+
+    rt.has_weak_work = true;
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 2), rt.weak_work_checks);
+    try std.testing.expect(rt.ephemeron_calls > 0);
+    try std.testing.expect(rt.after_weak_calls > 0);
+}
 
 test "mark-sweep: ephemeron values stay live only while keys are live" {
     const a = std.testing.allocator;
