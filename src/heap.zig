@@ -16,6 +16,7 @@
 //!
 //! Optional hooks:
 //!   fn hasWeakWork(ctx: *B) bool;
+//!   fn freeCellStorageBatch(ctx: *B, total: usize, allocations: []*anyopaque) void;
 //!   fn traceEphemeron(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
 //!   fn afterWeak(ctx: *B, cell: *anyopaque, kind: Kind) void;
 //!   fn traceOldOnMinor(kind: Kind) bool;
@@ -1421,6 +1422,10 @@ pub fn Heap(comptime Binding: type) type {
             var cycle_reclaimed_young_bytes: usize = 0;
             var cycle_promoted_cells: usize = 0;
             var cycle_promoted_bytes: usize = 0;
+            const release_batch_capacity = 64;
+            var release_batch: [release_batch_capacity]*anyopaque = undefined;
+            var release_batch_len: usize = 0;
+            var release_batch_bytes: usize = 0;
             var prev: ?*Header = null;
             var cur = self.all;
             while (cur) |h| {
@@ -1453,11 +1458,27 @@ pub fn Heap(comptime Binding: type) type {
                         self.young_bytes -= total;
                         cycle_reclaimed_young_bytes += total;
                     }
-                    const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
-                    self.backing.free(base[0..total]);
+                    if (@hasDecl(Binding, "freeCellStorageBatch")) {
+                        if (release_batch_len != 0 and release_batch_bytes != total) {
+                            Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, release_batch[0..release_batch_len]);
+                            release_batch_len = 0;
+                        }
+                        release_batch_bytes = total;
+                        release_batch[release_batch_len] = h;
+                        release_batch_len += 1;
+                        if (release_batch_len == release_batch.len) {
+                            Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, &release_batch);
+                            release_batch_len = 0;
+                        }
+                    } else {
+                        const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
+                        self.backing.free(base[0..total]);
+                    }
                 }
                 cur = next;
             }
+            if (@hasDecl(Binding, "freeCellStorageBatch") and release_batch_len != 0)
+                Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, release_batch[0..release_batch_len]);
 
             self.collections += 1;
             self.promoted_cells += cycle_promoted_cells;
@@ -1642,6 +1663,33 @@ const BatchAllocTestRT = struct {
     pub fn finalize(_: *BatchAllocTestRT, _: *anyopaque, _: Kind) void {}
 };
 
+const SweepBatchTestRT = struct {
+    pub const Kind = enum { node, large_node };
+    const Node = struct { value: usize = 0 };
+    const LargeNode = struct { bytes: [160]u8 = @splat(0) };
+
+    allocator: std.mem.Allocator,
+    release_calls: usize = 0,
+    released_cells: usize = 0,
+    smallest_batch: usize = std.math.maxInt(usize),
+    largest_batch: usize = 0,
+
+    pub fn traceRoots(_: *SweepBatchTestRT, _: anytype) void {}
+    pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
+    pub fn finalize(_: *SweepBatchTestRT, _: *anyopaque, _: Kind) void {}
+
+    pub fn freeCellStorageBatch(self: *SweepBatchTestRT, total: usize, allocations: []*anyopaque) void {
+        self.release_calls += 1;
+        self.released_cells += allocations.len;
+        self.smallest_batch = @min(self.smallest_batch, allocations.len);
+        self.largest_batch = @max(self.largest_batch, allocations.len);
+        for (allocations) |allocation| {
+            const base: [*]align(16) u8 = @ptrCast(@alignCast(allocation));
+            self.allocator.free(base[0..total]);
+        }
+    }
+};
+
 const OwnedCellTestRT = struct {
     pub const Kind = enum { node };
     const Node = struct { value: u32 = 0 };
@@ -1777,6 +1825,33 @@ test "deinit finalizes every remaining cell" {
 
     heap.deinit(); // no roots → everything is garbage, all finalized
     try std.testing.expectEqual(@as(usize, 10), rt.finalized.items.len);
+}
+
+test "sweep releases mixed cell storage through bounded same-size binding batches" {
+    const a = std.testing.allocator;
+    var rt = SweepBatchTestRT{ .allocator = a };
+    var heap = Heap(SweepBatchTestRT).init(a, &rt);
+    defer heap.deinit();
+
+    for (0..65) |value| {
+        const node = try heap.create(SweepBatchTestRT.Node, .node);
+        node.* = .{ .value = value };
+    }
+    for (0..3) |_| {
+        const node = try heap.create(SweepBatchTestRT.LargeNode, .large_node);
+        node.* = .{};
+    }
+    for (0..65) |value| {
+        const node = try heap.create(SweepBatchTestRT.Node, .node);
+        node.* = .{ .value = value + 65 };
+    }
+    heap.collect();
+
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 133), rt.released_cells);
+    try std.testing.expectEqual(@as(usize, 5), rt.release_calls);
+    try std.testing.expectEqual(@as(usize, 1), rt.smallest_batch);
+    try std.testing.expectEqual(@as(usize, 64), rt.largest_batch);
 }
 
 test "bulk deinit finalizes cells without individual backing frees" {
