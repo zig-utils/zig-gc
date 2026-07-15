@@ -61,6 +61,22 @@ starts. The collector checks its live header magic after ownership succeeds,
 clears that magic before freeing a cell, and retains the hash/all-cells fallback
 for other allocations and bindings without these hooks.
 
+An embedder whose backing allocator can reserve several equal-size slabs under
+one size-class lock may also provide:
+
+```zig
+fn allocateCellBatch(ctx: *B, total: usize, out: []*anyopaque) usize;
+```
+
+The hook writes 16-byte-aligned allocation-base pointers into a prefix of
+`out` and returns its length. The slabs must have exactly the same ownership
+and free semantics as individual `backing.alignedAlloc` results. A zero prefix
+asks the collector to use its normal allocation and recovery path; a short,
+non-zero prefix is published immediately so the caller can initialize and
+commit it before a later request performs recovery. The slabs stay private
+until `zig-gc` initializes their headers and publishes the whole prefix under
+one metadata lock.
+
 ## Usage
 
 ```zig
