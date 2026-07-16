@@ -89,6 +89,27 @@ commit it before a later request performs recovery. The slabs stay private
 until `zig-gc` initializes their headers and publishes the whole prefix under
 one metadata lock.
 
+Bindings that additionally prove every cell uses that owned storage and can
+publish exact slot ownership may provide:
+
+```zig
+fn allCellsUseOwnedStorage(ctx: *B) bool;
+fn publishCellAllocationBatch(
+    ctx: *B,
+    payloads: []*anyopaque,
+    total: usize,
+    payload_offset: usize,
+) void;
+```
+
+For batches of at least 64 cells while marking is inactive, `zig-gc` initializes
+and chains the private headers before taking the allocation-metadata lock,
+splices the chain and updates its counters in O(1), then releases that lock
+before the binding publishes its ownership bitmap. Payloads remain private
+until `createBatch` returns. Short batches, a changed nursery mode, and active
+marking retain the compact per-cell publication path, including born-grey
+semantics.
+
 ## Usage
 
 ```zig
@@ -112,11 +133,12 @@ heap.collect();                        // or force a full stop-the-world cycle
 `create` and `createBatch` return uninitialized payloads — initialize them
 before the next collection so a cycle never traces a half-built cell. Batched
 creation allocates private slabs first, then publishes their headers, all-cells
-links, nursery accounting, and born-grey state under one metadata lock. Cells
-are 16-byte aligned with a single-word header; recovering a header from a
-payload is O(1). A short batch reports its successfully published prefix so the
-caller can commit that work before the next allocation performs recovery or
-reports OOM, preserving sequential failure ordering.
+links, nursery accounting, and born-grey state under one metadata lock; large
+all-owned batches use the O(1) splice described above. Cells are 16-byte aligned
+with a single-word header; recovering a header from a payload is O(1). A short
+batch reports its successfully published prefix so the caller can commit that
+work before the next allocation performs recovery or reports OOM, preserving
+sequential failure ordering.
 
 ## Status
 
