@@ -22,6 +22,8 @@
 //!   fn traceOldOnMinor(kind: Kind) bool;
 //!   fn classifyConservativeInterior(ctx: *B, address: usize) InteriorOwnership;
 //!   fn allCellsUseOwnedStorage(ctx: *B) bool;
+//!   fn publishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
+//!   fn unpublishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -481,6 +483,16 @@ pub fn Heap(comptime Binding: type) type {
             return false;
         }
 
+        inline fn bindingPublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
+            if (@hasDecl(Binding, "publishCellAllocation"))
+                self.ctx.publishCellAllocation(allocation, total);
+        }
+
+        inline fn bindingUnpublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
+            if (@hasDecl(Binding, "unpublishCellAllocation"))
+                self.ctx.unpublishCellAllocation(allocation, total);
+        }
+
         fn syncAllocMetadata(self: *Self) bool {
             return self.parallel or self.concurrent_marker_metadata;
         }
@@ -627,6 +639,10 @@ pub fn Heap(comptime Binding: type) type {
             @atomicStore(bool, &h.young, self.nursery_enabled, .release);
             @atomicStore(bool, &h.remembered_owner, false, .release);
             @atomicStore(bool, &h.remembered_target, false, .release);
+            // An owned backing may reserve a slot before this private header is
+            // initialized. Publish only after every field is complete so its
+            // classifier's synchronization makes later header reads race-free.
+            self.bindingPublishCellAllocation(h, total);
             self.all = h;
             self.indexPayloadLocked(h);
             self.live_cells += 1;
@@ -1456,6 +1472,9 @@ pub fn Heap(comptime Binding: type) type {
                     }
                     prev = h;
                 } else {
+                    // Stop owned classifiers from returning this slot before
+                    // finalization clears side state or its header is reused.
+                    self.bindingUnpublishCellAllocation(h, total);
                     Binding.finalize(self.ctx, payloadOf(h), h.kind);
                     self.unindexPayloadLocked(h);
                     // Slab ownership outlives a freed slot. Clear the live-cell
@@ -1569,6 +1588,7 @@ pub fn Heap(comptime Binding: type) type {
             var cur = self.all;
             while (cur) |h| {
                 const next = h.next;
+                self.bindingUnpublishCellAllocation(h, header_stride + h.size);
                 Binding.finalize(self.ctx, payloadOf(h), h.kind);
                 if (free_cell_storage) {
                     const total = header_stride + h.size;
@@ -1726,6 +1746,8 @@ const OwnedCellTestRT = struct {
     conservative_words: []const usize = &.{},
     classify_calls: usize = 0,
     live: bool = false,
+    publish_calls: usize = 0,
+    unpublish_calls: usize = 0,
 
     pub fn traceRoots(self: *OwnedCellTestRT, v: anytype) void {
         for (self.conservative_words) |word| v.markConservativeWord(word);
@@ -1733,6 +1755,17 @@ const OwnedCellTestRT = struct {
     pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
     pub fn finalize(self: *OwnedCellTestRT, _: *anyopaque, _: Kind) void {
         self.live = false;
+    }
+    pub fn publishCellAllocation(self: *OwnedCellTestRT, allocation: *anyopaque, _: usize) void {
+        std.debug.assert(!self.live);
+        self.owned_header = allocation;
+        self.live = true;
+        self.publish_calls += 1;
+    }
+    pub fn unpublishCellAllocation(self: *OwnedCellTestRT, allocation: *anyopaque, _: usize) void {
+        std.debug.assert(self.live and self.owned_header == allocation);
+        self.live = false;
+        self.unpublish_calls += 1;
     }
     pub fn usesOwnedCellStorage(_: *OwnedCellTestRT, _: usize) bool {
         return true;
@@ -2262,14 +2295,14 @@ test "owned cell hook replaces the payload index and rejects stale cells" {
 
     const live = try heap.create(OwnedCellTestRT.Node, .node);
     live.* = .{ .value = 7 };
-    rt.owned_header = @ptrFromInt(@intFromPtr(live) - H.header_stride);
-    rt.live = true;
 
+    try std.testing.expectEqual(@as(usize, 1), rt.publish_calls);
     try std.testing.expectEqual(@as(usize, 0), heap.payload_index.count());
     var visitor = H.Visitor{ .heap = &heap };
     try std.testing.expect(visitor.isManaged(live));
 
     heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), rt.unpublish_calls);
     try std.testing.expect(!visitor.isManaged(live));
 }
 
@@ -2286,7 +2319,6 @@ test "owned conservative classification skips the generic address index" {
     rt.owned_start = header;
     rt.owned_end = header + H.cellAllocationBytes(OwnedCellTestRT.Node) + 16;
     rt.owned_empty_address = 0x1111;
-    rt.live = true;
 
     const words = [_]usize{
         header,
