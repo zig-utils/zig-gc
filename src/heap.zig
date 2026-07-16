@@ -23,6 +23,7 @@
 //!   fn classifyConservativeInterior(ctx: *B, address: usize) InteriorOwnership;
 //!   fn allCellsUseOwnedStorage(ctx: *B) bool;
 //!   fn publishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
+//!   fn publishCellAllocationBatch(ctx: *B, payloads: []*anyopaque, total: usize, payload_offset: usize) void;
 //!   fn unpublishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
@@ -488,6 +489,17 @@ pub fn Heap(comptime Binding: type) type {
                 self.ctx.publishCellAllocation(allocation, total);
         }
 
+        inline fn bindingPublishCellAllocationBatch(self: *Self, payloads: []*anyopaque, total: usize, payload_offset: usize) void {
+            if (@hasDecl(Binding, "publishCellAllocationBatch")) {
+                self.ctx.publishCellAllocationBatch(payloads, total, payload_offset);
+            } else if (@hasDecl(Binding, "publishCellAllocation")) {
+                for (payloads) |payload| {
+                    const base: *anyopaque = @ptrFromInt(@intFromPtr(payload) - payload_offset);
+                    self.ctx.publishCellAllocation(base, total);
+                }
+            }
+        }
+
         inline fn bindingUnpublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
             if (@hasDecl(Binding, "unpublishCellAllocation"))
                 self.ctx.unpublishCellAllocation(allocation, total);
@@ -620,7 +632,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Publish one privately allocated header. The caller serializes
         /// allocation metadata when required and supplies one marking-state
         /// snapshot for the complete publication batch.
-        inline fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool) *T {
+        inline fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool, publish_binding: bool) *T {
             const total = cellAllocationBytes(T);
             // Field-wise init (not a struct literal) so `marked` is written
             // *atomically*: under a parallel concurrent mark the marker may
@@ -642,7 +654,7 @@ pub fn Heap(comptime Binding: type) type {
             // An owned backing may reserve a slot before this private header is
             // initialized. Publish only after every field is complete so its
             // classifier's synchronization makes later header reads race-free.
-            self.bindingPublishCellAllocation(h, total);
+            if (publish_binding) self.bindingPublishCellAllocation(h, total);
             self.all = h;
             self.indexPayloadLocked(h);
             self.live_cells += 1;
@@ -697,7 +709,7 @@ pub fn Heap(comptime Binding: type) type {
             // runs). This is what lets the embedder barrier only post-creation
             // mutations instead of every initializing store. Children added after
             // it is traced are caught by the insertion `writeBarrier`.
-            return self.publishCellLocked(T, kind, h, self.marking.load(.acquire));
+            return self.publishCellLocked(T, kind, h, self.marking.load(.acquire), true);
         }
 
         /// Allocate several same-kind cells privately, then publish the
@@ -753,9 +765,11 @@ pub fn Heap(comptime Binding: type) type {
             const born_grey = self.marking.load(.acquire);
             for (out) |payload| {
                 const h = headerOf(payload);
-                const published = self.publishCellLocked(T, kind, h, born_grey);
+                const published = self.publishCellLocked(T, kind, h, born_grey, false);
                 std.debug.assert(published == payload);
             }
+            const raw: []*anyopaque = @as([*]*anyopaque, @ptrCast(out.ptr))[0..out.len];
+            self.bindingPublishCellAllocationBatch(raw, cellAllocationBytes(T), header_stride);
             return out.len;
         }
 
@@ -1691,6 +1705,8 @@ const BatchAllocTestRT = struct {
     allocator: std.mem.Allocator,
     limit: usize = std.math.maxInt(usize),
     batch_calls: usize = 0,
+    publish_batch_calls: usize = 0,
+    published_cells: usize = 0,
 
     pub fn allocateCellBatch(self: *BatchAllocTestRT, total: usize, out: []*anyopaque) usize {
         self.batch_calls += 1;
@@ -1701,6 +1717,12 @@ const BatchAllocTestRT = struct {
             out[allocated] = @ptrCast(slab.ptr);
         }
         return allocated;
+    }
+
+    pub fn publishCellAllocationBatch(self: *BatchAllocTestRT, payloads: []*anyopaque, _: usize, payload_offset: usize) void {
+        self.publish_batch_calls += 1;
+        self.published_cells += payloads.len;
+        for (payloads) |payload| std.debug.assert(@intFromPtr(payload) > payload_offset);
     }
 
     pub fn traceRoots(_: *BatchAllocTestRT, _: anytype) void {}
@@ -2936,6 +2958,8 @@ test "createBatch uses an embedder slab batch and publishes a short prefix" {
     const locks_before = heap.alloc_lock_acquisitions_for_testing;
     try std.testing.expectEqual(@as(usize, 3), try heap.createBatch(N, .node, &nodes));
     try std.testing.expectEqual(@as(usize, 1), rt.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), rt.publish_batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), rt.published_cells);
     try std.testing.expectEqual(locks_before + 1, heap.alloc_lock_acquisitions_for_testing);
     for (nodes[0..3], 0..) |node, i| node.* = .{ .id = @intCast(i) };
     try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
