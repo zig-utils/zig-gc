@@ -760,16 +760,66 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         inline fn publishBatch(self: *Self, comptime T: type, kind: Kind, out: []*T) usize {
+            const total = cellAllocationBytes(T);
+            // Private header chaining pays for itself on genuinely amortized
+            // batches. Keep short batches on the compact proven loop: their
+            // lock hold is already small, while building a second private
+            // chain adds work without relieving meaningful contention.
+            const owned_fast_path = self.bindingAllCellsUseOwnedStorage() and out.len >= 64;
+            const nursery_snapshot = self.nursery_enabled;
+            var private_head: ?*Header = null;
+            var private_tail: ?*Header = null;
+            if (owned_fast_path and !self.marking.load(.acquire)) {
+                for (out) |payload| {
+                    const h = headerOf(payload);
+                    h.magic = header_magic;
+                    h.next = private_head;
+                    h.size = @sizeOf(T);
+                    h.kind = kind;
+                    @atomicStore(bool, &h.marked, false, .release);
+                    @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                    @atomicStore(bool, &h.remembered_owner, false, .release);
+                    @atomicStore(bool, &h.remembered_target, false, .release);
+                    if (private_tail == null) private_tail = h;
+                    private_head = h;
+                }
+            }
+
             if (self.syncAllocMetadata()) self.lockAlloc();
-            defer if (self.syncAllocMetadata()) self.unlockAlloc();
-            const born_grey = self.marking.load(.acquire);
-            for (out) |payload| {
-                const h = headerOf(payload);
-                const published = self.publishCellLocked(T, kind, h, born_grey, false);
-                std.debug.assert(published == payload);
+            if (private_head != null and !self.marking.load(.acquire) and self.nursery_enabled == nursery_snapshot) {
+                private_tail.?.next = self.all;
+                self.all = private_head;
+                self.live_cells += out.len;
+                self.bytes_live += total * out.len;
+                if (nursery_snapshot) {
+                    self.young_cells += out.len;
+                    self.young_bytes += total * out.len;
+                }
+                if (self.syncAllocMetadata()) self.unlockAlloc();
+
+                // Every header is complete and linked before the binding
+                // publishes its ownership bitmap. Do that second publication
+                // after releasing alloc_lock: bindings commonly serialize
+                // their bitmap by size class, and nesting that lock inside the
+                // global heap-publication lock turns unrelated mutators into
+                // one long convoy. The payloads remain private to the caller
+                // until createBatch returns, while an exact lookup during this
+                // short interval can still use the all-list fallback under
+                // alloc_lock.
+                const raw: []*anyopaque = @as([*]*anyopaque, @ptrCast(out.ptr))[0..out.len];
+                self.bindingPublishCellAllocationBatch(raw, total, header_stride);
+                return out.len;
+            } else {
+                const born_grey = self.marking.load(.acquire);
+                for (out) |payload| {
+                    const h = headerOf(payload);
+                    const published = self.publishCellLocked(T, kind, h, born_grey, false);
+                    std.debug.assert(published == payload);
+                }
             }
             const raw: []*anyopaque = @as([*]*anyopaque, @ptrCast(out.ptr))[0..out.len];
-            self.bindingPublishCellAllocationBatch(raw, cellAllocationBytes(T), header_stride);
+            self.bindingPublishCellAllocationBatch(raw, total, header_stride);
+            if (self.syncAllocMetadata()) self.unlockAlloc();
             return out.len;
         }
 
@@ -1707,6 +1757,8 @@ const BatchAllocTestRT = struct {
     batch_calls: usize = 0,
     publish_batch_calls: usize = 0,
     published_cells: usize = 0,
+    alloc_lock_probe: ?*std.atomic.Value(u32) = null,
+    published_while_alloc_locked: bool = false,
 
     pub fn allocateCellBatch(self: *BatchAllocTestRT, total: usize, out: []*anyopaque) usize {
         self.batch_calls += 1;
@@ -1722,7 +1774,13 @@ const BatchAllocTestRT = struct {
     pub fn publishCellAllocationBatch(self: *BatchAllocTestRT, payloads: []*anyopaque, _: usize, payload_offset: usize) void {
         self.publish_batch_calls += 1;
         self.published_cells += payloads.len;
+        if (self.alloc_lock_probe) |lock|
+            self.published_while_alloc_locked = lock.load(.monotonic) != 0;
         for (payloads) |payload| std.debug.assert(@intFromPtr(payload) > payload_offset);
+    }
+
+    pub fn allCellsUseOwnedStorage(_: *BatchAllocTestRT) bool {
+        return true;
     }
 
     pub fn traceRoots(_: *BatchAllocTestRT, _: anytype) void {}
@@ -2945,13 +3003,15 @@ test "createBatch publishes nursery cells under one allocation lock" {
     try std.testing.expectEqual(nodes.len, walked);
 }
 
-test "createBatch uses an embedder slab batch and publishes a short prefix" {
+test "createBatch keeps a short embedder batch on the compact publication path" {
     const a = std.testing.allocator;
     var rt = BatchAllocTestRT{ .allocator = a, .limit = 3 };
-    var heap = Heap(BatchAllocTestRT).init(a, &rt);
+    const H = Heap(BatchAllocTestRT);
+    var heap = H.init(a, &rt);
     heap.setParallel(true);
     heap.setNurseryEnabled(true);
     defer heap.deinit();
+    rt.alloc_lock_probe = &heap.alloc_lock;
 
     const N = BatchAllocTestRT.Node;
     var nodes: [8]*N = undefined;
@@ -2960,10 +3020,37 @@ test "createBatch uses an embedder slab batch and publishes a short prefix" {
     try std.testing.expectEqual(@as(usize, 1), rt.batch_calls);
     try std.testing.expectEqual(@as(usize, 1), rt.publish_batch_calls);
     try std.testing.expectEqual(@as(usize, 3), rt.published_cells);
+    try std.testing.expect(rt.published_while_alloc_locked);
     try std.testing.expectEqual(locks_before + 1, heap.alloc_lock_acquisitions_for_testing);
+    try std.testing.expectEqual(nodes[2], @as(*N, @ptrCast(@alignCast(H.payloadOf(heap.all.?)))));
+    try std.testing.expectEqual(nodes[1], @as(*N, @ptrCast(@alignCast(H.payloadOf(heap.all.?.next.?)))));
+    try std.testing.expectEqual(nodes[0], @as(*N, @ptrCast(@alignCast(H.payloadOf(heap.all.?.next.?.next.?)))));
     for (nodes[0..3], 0..) |node, i| node.* = .{ .id = @intCast(i) };
     try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 3), heap.young_cells);
+}
+
+test "large owned createBatch splices before publishing outside the allocation lock" {
+    const a = std.testing.allocator;
+    var rt = BatchAllocTestRT{ .allocator = a };
+    const H = Heap(BatchAllocTestRT);
+    var heap = H.init(a, &rt);
+    heap.setParallel(true);
+    heap.setNurseryEnabled(true);
+    defer heap.deinit();
+    rt.alloc_lock_probe = &heap.alloc_lock;
+
+    const N = BatchAllocTestRT.Node;
+    var nodes: [64]*N = undefined;
+    const locks_before = heap.alloc_lock_acquisitions_for_testing;
+    try std.testing.expectEqual(nodes.len, try heap.createBatch(N, .node, &nodes));
+    try std.testing.expectEqual(@as(usize, 1), rt.publish_batch_calls);
+    try std.testing.expectEqual(nodes.len, rt.published_cells);
+    try std.testing.expect(!rt.published_while_alloc_locked);
+    try std.testing.expectEqual(locks_before + 1, heap.alloc_lock_acquisitions_for_testing);
+    try std.testing.expectEqual(nodes[nodes.len - 1], @as(*N, @ptrCast(@alignCast(H.payloadOf(heap.all.?)))));
+    try std.testing.expectEqual(nodes.len, heap.live_cells);
+    try std.testing.expectEqual(nodes.len, heap.young_cells);
 }
 
 test "createBatch falls back normally when the embedder batch is empty" {
@@ -2978,6 +3065,30 @@ test "createBatch falls back normally when the embedder batch is empty" {
     try std.testing.expectEqual(@as(usize, 1), rt.batch_calls);
     for (nodes, 0..) |node, i| node.* = .{ .id = @intCast(i) };
     try std.testing.expectEqual(nodes.len, heap.live_cells);
+}
+
+test "owned createBatch keeps the marking publication fallback" {
+    const a = std.testing.allocator;
+    var rt = BatchAllocTestRT{ .allocator = a };
+    const H = Heap(BatchAllocTestRT);
+    var heap = H.init(a, &rt);
+    heap.setParallel(true);
+    defer heap.deinit();
+    rt.alloc_lock_probe = &heap.alloc_lock;
+    heap.marking.store(true, .release);
+
+    const N = BatchAllocTestRT.Node;
+    var nodes: [4]*N = undefined;
+    try std.testing.expectEqual(nodes.len, try heap.createBatch(N, .node, &nodes));
+    var header = heap.all;
+    var count: usize = 0;
+    while (header) |h| : (header = h.next) {
+        try std.testing.expect(@atomicLoad(bool, &h.marked, .acquire));
+        count += 1;
+    }
+    try std.testing.expectEqual(nodes.len, count);
+    try std.testing.expectEqual(@as(usize, 1), rt.publish_batch_calls);
+    try std.testing.expect(rt.published_while_alloc_locked);
 }
 
 test "createBatch publishes a partial prefix before preserving OOM order" {
