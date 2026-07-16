@@ -910,7 +910,19 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         inline fn lockAlloc(self: *Self) void {
-            while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+            var spins: usize = 0;
+            while (self.alloc_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                while (self.alloc_lock.load(.monotonic) != 0) : (spins += 1) {
+                    // Read-spin while a peer owns the short publication
+                    // section instead of issuing a failing CAS on every pass;
+                    // yield periodically so many mutators do not starve the
+                    // current owner on CPU-saturated heaps.
+                    if ((spins & 0x3f) == 0x3f)
+                        std.Thread.yield() catch {}
+                    else
+                        std.atomic.spinLoopHint();
+                }
+            }
             if (builtin.is_test) self.alloc_lock_acquisitions_for_testing += 1;
         }
         inline fn unlockAlloc(self: *Self) void {
