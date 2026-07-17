@@ -128,6 +128,7 @@ for (objects[0..count]) |item| item.* = .{ ... }; // initialize before a safepoi
 
 heap.maybeCollect();                   // call at safepoints; collects past a threshold
 heap.collect();                        // or force a full stop-the-world cycle
+const stats = heap.accounting();       // race-safe live/last-full byte snapshot
 ```
 
 `create` and `createBatch` return uninitialized payloads — initialize them
@@ -139,6 +140,11 @@ with a single-word header; recovering a header from a payload is O(1). A short
 batch reports its successfully published prefix so the caller can commit that
 work before the next allocation performs recovery or reports OOM, preserving
 sequential failure ordering.
+
+`accounting()` snapshots live cell/byte totals, collection counts, and the
+post-sweep byte size of the last completed full collection. Parallel and
+concurrent-metadata heaps take the collector's allocation lock for the snapshot;
+nursery-only cycles deliberately leave `last_full_collection_bytes` unchanged.
 
 ## Status
 

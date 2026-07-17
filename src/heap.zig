@@ -160,6 +160,7 @@ pub fn Heap(comptime Binding: type) type {
         marked_count: usize = 0,
         collections: usize = 0,
         full_collections: usize = 0,
+        last_full_collection_bytes: usize = 0,
         minor_collections: usize = 0,
         promoted_cells: usize = 0,
         promoted_bytes: usize = 0,
@@ -406,6 +407,33 @@ pub fn Heap(comptime Binding: type) type {
             if (!enabled and self.nursery_enabled and self.young_cells != 0)
                 self.tenureYoungPrefix();
             self.nursery_enabled = enabled;
+        }
+
+        /// Race-safe accounting snapshot for embedders that expose heap usage
+        /// or collection telemetry. `live_bytes` includes the collector header
+        /// and payload allocation for every currently live cell. The
+        /// last-full value changes only after a completed full sweep, never
+        /// after a nursery-only cycle or an in-progress concurrent mark.
+        pub const Accounting = struct {
+            live_cells: usize,
+            live_bytes: usize,
+            last_full_collection_bytes: usize,
+            collections: usize,
+            full_collections: usize,
+            minor_collections: usize,
+        };
+
+        pub fn accounting(self: *Self) Accounting {
+            if (self.syncAllocMetadata()) self.lockAlloc();
+            defer if (self.syncAllocMetadata()) self.unlockAlloc();
+            return .{
+                .live_cells = self.live_cells,
+                .live_bytes = self.bytes_live,
+                .last_full_collection_bytes = self.last_full_collection_bytes,
+                .collections = self.collections,
+                .full_collections = self.full_collections,
+                .minor_collections = self.minor_collections,
+            };
         }
 
         fn tenureYoungPrefix(self: *Self) void {
@@ -1599,6 +1627,7 @@ pub fn Heap(comptime Binding: type) type {
                 self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_young_bytes, cycle_promoted_bytes);
             } else {
                 self.full_collections += 1;
+                self.last_full_collection_bytes = self.bytes_live;
                 self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
             }
             self.clearRemembered();
@@ -1666,6 +1695,7 @@ pub fn Heap(comptime Binding: type) type {
             self.payload_index = .empty;
             self.live_cells = 0;
             self.bytes_live = 0;
+            self.last_full_collection_bytes = 0;
             self.young_cells = 0;
             self.young_bytes = 0;
             self.mark_stack.deinit(self.aux);
@@ -1990,6 +2020,45 @@ test "sweep releases mixed cell storage through bounded same-size binding batche
     try std.testing.expectEqual(@as(usize, 5), rt.release_calls);
     try std.testing.expectEqual(@as(usize, 1), rt.smallest_batch);
     try std.testing.expectEqual(@as(usize, 64), rt.largest_batch);
+}
+
+test "accounting snapshots live and last-full bytes without minor-cycle drift" {
+    const a = std.testing.allocator;
+    const H = Heap(TestRT);
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setParallel(true);
+    heap.setNurseryEnabled(true);
+
+    const live = try heap.create(TestRT.Node, .node);
+    live.* = .{ .id = 1 };
+    const dead = try heap.create(TestRT.Node, .node);
+    dead.* = .{ .id = 2 };
+    try rt.roots.append(a, live);
+
+    const cell_bytes = H.cellAllocationBytes(TestRT.Node);
+    const before = heap.accounting();
+    try std.testing.expectEqual(@as(usize, 2), before.live_cells);
+    try std.testing.expectEqual(cell_bytes * 2, before.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), before.last_full_collection_bytes);
+
+    heap.collectYoung();
+    const after_minor = heap.accounting();
+    try std.testing.expectEqual(@as(usize, 1), after_minor.live_cells);
+    try std.testing.expectEqual(cell_bytes, after_minor.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), after_minor.last_full_collection_bytes);
+    try std.testing.expectEqual(@as(usize, 1), after_minor.minor_collections);
+
+    heap.collect();
+    const after_full = heap.accounting();
+    try std.testing.expectEqual(cell_bytes, after_full.live_bytes);
+    try std.testing.expectEqual(cell_bytes, after_full.last_full_collection_bytes);
+    try std.testing.expectEqual(@as(usize, 2), after_full.collections);
+    try std.testing.expectEqual(@as(usize, 1), after_full.full_collections);
 }
 
 test "bulk deinit finalizes cells without individual backing frees" {
