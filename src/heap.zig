@@ -157,6 +157,10 @@ pub fn Heap(comptime Binding: type) type {
         threshold_bytes: usize = 64 * 1024,
         mark_stack: std.ArrayListUnmanaged(*Header) = .empty,
         weak_slots: std.ArrayListUnmanaged(*?*anyopaque) = .empty,
+        /// Weak roots owned by concurrent embedders. Unlike cell-internal weak
+        /// slots, these may be read or cleared while marking is active, so the
+        /// collector snapshots with acquire and clears with a compare-exchange.
+        weak_atomic_slots: std.ArrayListUnmanaged(*std.atomic.Value(?*anyopaque)) = .empty,
         marked_count: usize = 0,
         collections: usize = 0,
         full_collections: usize = 0,
@@ -362,6 +366,17 @@ pub fn Heap(comptime Binding: type) type {
                 v.heap.lockWeak();
                 defer v.heap.unlockWeak();
                 v.heap.weak_slots.append(v.heap.aux, slot) catch {
+                    v.oom = true;
+                };
+            }
+
+            /// Register an externally synchronized weak slot. Clearing uses a
+            /// CAS so a concurrent embedder clear cannot race a plain store and
+            /// a future retargeting API cannot lose a newly published target.
+            pub fn markWeakAtomic(v: *Visitor, slot: *std.atomic.Value(?*anyopaque)) void {
+                v.heap.lockWeak();
+                defer v.heap.unlockWeak();
+                v.heap.weak_atomic_slots.append(v.heap.aux, slot) catch {
                     v.oom = true;
                 };
             }
@@ -1058,6 +1073,7 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
             // Weak-slot registration can run while a concurrent marker traces
             // object cells and mutators grow their own side storage. Reserve the
             // per-cycle scratch up front, at the safepoint, so `markWeak` never
@@ -1065,6 +1081,7 @@ pub fn Heap(comptime Binding: type) type {
             // a mutator's object-backing write (the same allocator-reuse TSan
             // class the mark-stack reservation avoids).
             self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -1142,10 +1159,12 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
             // A minor cycle can still trace old roots/remembered owners that
             // register weak slots, so reserve to the full live-cell bound rather
             // than only the young-cell count.
             self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -1253,10 +1272,12 @@ pub fn Heap(comptime Binding: type) type {
             self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
             // See `startMarking`: weak-slot scratch is marker-side state, but it
             // must not allocate from `aux` while parallel mutators are growing
             // object backing stores.
             self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
             self.unlockWeak();
             self.barrier_buf.clearRetainingCapacity();
             self.born_concurrent.clearRetainingCapacity();
@@ -1526,6 +1547,12 @@ pub fn Heap(comptime Binding: type) type {
                         if (!self.isLive(target)) slot.* = null;
                     }
                 }
+                for (self.weak_atomic_slots.items) |slot| {
+                    if (slot.load(.acquire)) |target| {
+                        if (!self.isLive(target))
+                            _ = slot.cmpxchgStrong(target, null, .acq_rel, .acquire);
+                    }
+                }
                 self.unlockWeak();
 
                 if (@hasDecl(Binding, "afterWeak")) {
@@ -1666,7 +1693,9 @@ pub fn Heap(comptime Binding: type) type {
             self.trimEmptyScratchList(*Header, &self.mark_stack);
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
             self.trimEmptyScratchList(*?*anyopaque, &self.weak_slots);
+            self.trimEmptyScratchList(*std.atomic.Value(?*anyopaque), &self.weak_atomic_slots);
             self.unlockWeak();
             self.lockRemember();
             self.trimEmptyScratchList(*Header, &self.remembered_owners);
@@ -1700,6 +1729,7 @@ pub fn Heap(comptime Binding: type) type {
             self.young_bytes = 0;
             self.mark_stack.deinit(self.aux);
             self.weak_slots.deinit(self.aux);
+            self.weak_atomic_slots.deinit(self.aux);
             self.addr_index.deinit(self.aux);
             self.barrier_buf.deinit(self.aux);
             self.born_concurrent.deinit(self.aux);
@@ -1743,10 +1773,12 @@ const TestRT = struct {
     roots: std.ArrayListUnmanaged(*Node) = .empty,
     finalized: std.ArrayListUnmanaged(u32) = .empty,
     conservative_words: []const usize = &.{},
+    atomic_weak_root: ?*std.atomic.Value(?*anyopaque) = null,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
         for (self.conservative_words) |word| v.markConservativeWord(word);
+        if (self.atomic_weak_root) |slot| v.markWeakAtomic(slot);
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -2226,6 +2258,7 @@ test "collector scratch frees oversized empty buffers after spike" {
     const oversized = retained + 1;
     try heap.mark_stack.ensureTotalCapacityPrecise(a, oversized);
     try heap.weak_slots.ensureTotalCapacityPrecise(a, oversized);
+    try heap.weak_atomic_slots.ensureTotalCapacityPrecise(a, oversized);
     try heap.remembered_owners.ensureTotalCapacityPrecise(a, oversized);
     try heap.remembered_targets.ensureTotalCapacityPrecise(a, oversized);
     try heap.barrier_buf.ensureTotalCapacityPrecise(a, oversized);
@@ -2237,6 +2270,7 @@ test "collector scratch frees oversized empty buffers after spike" {
 
     try std.testing.expectEqual(@as(usize, 0), heap.mark_stack.capacity);
     try std.testing.expectEqual(@as(usize, 0), heap.weak_slots.capacity);
+    try std.testing.expectEqual(@as(usize, 0), heap.weak_atomic_slots.capacity);
     try std.testing.expectEqual(@as(usize, 0), heap.remembered_owners.capacity);
     try std.testing.expectEqual(@as(usize, 0), heap.remembered_targets.capacity);
     try std.testing.expectEqual(@as(usize, 0), heap.barrier_buf.capacity);
@@ -2246,6 +2280,32 @@ test "collector scratch frees oversized empty buffers after spike" {
     try heap.mark_stack.ensureTotalCapacityPrecise(a, retained);
     heap.trimCollectorScratch();
     try std.testing.expectEqual(retained, heap.mark_stack.capacity);
+}
+
+test "atomic weak roots survive only while strongly reachable" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const target = try heap.create(TestRT.Node, .node);
+    target.* = .{ .id = 71 };
+    var slot = std.atomic.Value(?*anyopaque).init(@ptrCast(target));
+    rt.atomic_weak_root = &slot;
+    try rt.roots.append(a, target);
+
+    heap.collect();
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(target)), slot.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+
+    rt.roots.clearRetainingCapacity();
+    heap.collect();
+    try std.testing.expectEqual(@as(?*anyopaque, null), slot.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    try std.testing.expectEqualSlices(u32, &.{71}, rt.finalized.items);
 }
 
 test "nursery owner barrier preserves old-to-young edges" {
