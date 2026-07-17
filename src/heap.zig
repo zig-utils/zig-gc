@@ -1555,6 +1555,12 @@ pub fn Heap(comptime Binding: type) type {
                 }
                 self.unlockWeak();
 
+                // External weak owners may need to publish host cleanup after
+                // an atomic slot is cleared. Run that hook outside `weak_lock`:
+                // host finalizers can release handles or otherwise re-enter the
+                // embedder and must never execute under collector scratch locks.
+                if (@hasDecl(Binding, "afterWeakRoots")) Binding.afterWeakRoots(self.ctx);
+
                 if (@hasDecl(Binding, "afterWeak")) {
                     var wit = self.all;
                     while (wit) |h| : (wit = h.next) {
@@ -1774,11 +1780,16 @@ const TestRT = struct {
     finalized: std.ArrayListUnmanaged(u32) = .empty,
     conservative_words: []const usize = &.{},
     atomic_weak_root: ?*std.atomic.Value(?*anyopaque) = null,
+    after_weak_roots_calls: usize = 0,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
         for (self.conservative_words) |word| v.markConservativeWord(word);
         if (self.atomic_weak_root) |slot| v.markWeakAtomic(slot);
+    }
+
+    pub fn afterWeakRoots(self: *TestRT) void {
+        self.after_weak_roots_calls += 1;
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -2300,12 +2311,14 @@ test "atomic weak roots survive only while strongly reachable" {
     heap.collect();
     try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(target)), slot.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), rt.after_weak_roots_calls);
 
     rt.roots.clearRetainingCapacity();
     heap.collect();
     try std.testing.expectEqual(@as(?*anyopaque, null), slot.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     try std.testing.expectEqualSlices(u32, &.{71}, rt.finalized.items);
+    try std.testing.expectEqual(@as(usize, 2), rt.after_weak_roots_calls);
 }
 
 test "nursery owner barrier preserves old-to-young edges" {
