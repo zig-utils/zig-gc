@@ -1320,6 +1320,7 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.sweepPhase(&v);
             self.reopenShardedPublication();
+            self.runAfterSweep();
         }
 
         /// A full stop-the-world cycle: mark from roots, clear dead weak edges,
@@ -1413,6 +1414,7 @@ pub fn Heap(comptime Binding: type) type {
             self.sweepPhase(&v);
             self.collection_kind = .full;
             self.reopenShardedPublication();
+            self.runAfterSweep();
         }
 
         // ---- Concurrent marking (M3) -------------------------------------
@@ -1561,6 +1563,7 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.sweepPhase(&v);
             self.reopenShardedPublication();
+            self.runAfterSweep();
         }
 
         /// Pending mutator-allocated cells not yet folded into the mark (M3
@@ -1730,7 +1733,6 @@ pub fn Heap(comptime Binding: type) type {
                 defer if (self.parallel) self.unlockAlloc();
                 self.sweepPhaseLocked(v);
             }
-            self.runAfterSweep();
         }
 
         /// Let the embedder drain work queued by cell finalizers after the
@@ -2027,6 +2029,8 @@ const TestRT = struct {
     finalized_at_last_after_sweep: usize = 0,
     alloc_lock_probe: ?*std.atomic.Value(u32) = null,
     after_sweep_under_alloc_lock: bool = false,
+    publication_gate_probe: ?*std.atomic.Value(bool) = null,
+    after_sweep_before_publication_reopened: bool = false,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
@@ -2043,6 +2047,8 @@ const TestRT = struct {
         self.finalized_at_last_after_sweep = self.finalized.items.len;
         if (self.alloc_lock_probe) |lock|
             self.after_sweep_under_alloc_lock = lock.load(.monotonic) != 0;
+        if (self.publication_gate_probe) |gate|
+            self.after_sweep_before_publication_reopened = !gate.load(.acquire);
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -2447,6 +2453,7 @@ test "post-sweep hook observes finalizers after the parallel allocation lock is 
     defer heap.deinit();
     heap.setParallel(true);
     rt.alloc_lock_probe = &heap.alloc_lock;
+    rt.publication_gate_probe = &heap.sharded_publication_gate;
     heap.setNurseryEnabled(true);
 
     const nursery_garbage = try heap.create(TestRT.Node, .node);
@@ -2455,6 +2462,7 @@ test "post-sweep hook observes finalizers after the parallel allocation lock is 
     try std.testing.expectEqual(@as(usize, 1), rt.after_sweep_calls);
     try std.testing.expectEqual(@as(usize, 1), rt.finalized_at_last_after_sweep);
     try std.testing.expect(!rt.after_sweep_under_alloc_lock);
+    try std.testing.expect(!rt.after_sweep_before_publication_reopened);
 
     const full_garbage = try heap.create(TestRT.Node, .node);
     full_garbage.* = .{ .id = 35 };
@@ -2462,6 +2470,7 @@ test "post-sweep hook observes finalizers after the parallel allocation lock is 
     try std.testing.expectEqual(@as(usize, 2), rt.after_sweep_calls);
     try std.testing.expectEqual(@as(usize, 2), rt.finalized_at_last_after_sweep);
     try std.testing.expect(!rt.after_sweep_under_alloc_lock);
+    try std.testing.expect(!rt.after_sweep_before_publication_reopened);
 
     heap.beginConcurrentMarkParallel();
     heap.abortConcurrentMarkParallel();
@@ -2475,6 +2484,7 @@ test "post-sweep hook observes finalizers after the parallel allocation lock is 
     try std.testing.expectEqual(@as(usize, 3), rt.after_sweep_calls);
     try std.testing.expectEqual(@as(usize, 3), rt.finalized_at_last_after_sweep);
     try std.testing.expect(!rt.after_sweep_under_alloc_lock);
+    try std.testing.expect(!rt.after_sweep_before_publication_reopened);
 }
 
 test "deinit finalizes every remaining cell" {
