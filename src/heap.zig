@@ -1653,6 +1653,7 @@ pub fn Heap(comptime Binding: type) type {
             self.sweepPhaseLocked(&v); // alloc_lock already held
             self.reopenShardedPublication();
             self.unlockAlloc();
+            self.runAfterSweep();
             return true;
         }
 
@@ -1724,9 +1725,20 @@ pub fn Heap(comptime Binding: type) type {
         /// re-enter `lockAlloc` — a non-reentrant leaf spinlock); this engine's
         /// finalizers only release native side storage, never allocate cells.
         fn sweepPhase(self: *Self, v: *Visitor) void {
-            if (self.parallel) self.lockAlloc();
-            defer if (self.parallel) self.unlockAlloc();
-            self.sweepPhaseLocked(v);
+            {
+                if (self.parallel) self.lockAlloc();
+                defer if (self.parallel) self.unlockAlloc();
+                self.sweepPhaseLocked(v);
+            }
+            self.runAfterSweep();
+        }
+
+        /// Let the embedder drain work queued by cell finalizers after the
+        /// collector has completed sweep accounting and released alloc_lock.
+        /// The hook is optional and is invoked exactly once per successful
+        /// full, nursery, or concurrent sweep; aborted cycles do not invoke it.
+        fn runAfterSweep(self: *Self) void {
+            if (@hasDecl(Binding, "afterSweep")) Binding.afterSweep(self.ctx);
         }
 
         /// The sweep tail proper, assuming `alloc_lock` is already held under
@@ -2011,6 +2023,10 @@ const TestRT = struct {
     conservative_words: []const usize = &.{},
     atomic_weak_root: ?*std.atomic.Value(?*anyopaque) = null,
     after_weak_roots_calls: usize = 0,
+    after_sweep_calls: usize = 0,
+    finalized_at_last_after_sweep: usize = 0,
+    alloc_lock_probe: ?*std.atomic.Value(u32) = null,
+    after_sweep_under_alloc_lock: bool = false,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
@@ -2020,6 +2036,13 @@ const TestRT = struct {
 
     pub fn afterWeakRoots(self: *TestRT) void {
         self.after_weak_roots_calls += 1;
+    }
+
+    pub fn afterSweep(self: *TestRT) void {
+        self.after_sweep_calls += 1;
+        self.finalized_at_last_after_sweep = self.finalized.items.len;
+        if (self.alloc_lock_probe) |lock|
+            self.after_sweep_under_alloc_lock = lock.load(.monotonic) != 0;
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -2412,6 +2435,46 @@ test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear"
     heap.collect();
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 3), rt.finalized.items.len);
+}
+
+test "post-sweep hook observes finalizers after the parallel allocation lock is released" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setParallel(true);
+    rt.alloc_lock_probe = &heap.alloc_lock;
+    heap.setNurseryEnabled(true);
+
+    const nursery_garbage = try heap.create(TestRT.Node, .node);
+    nursery_garbage.* = .{ .id = 34 };
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 1), rt.after_sweep_calls);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized_at_last_after_sweep);
+    try std.testing.expect(!rt.after_sweep_under_alloc_lock);
+
+    const full_garbage = try heap.create(TestRT.Node, .node);
+    full_garbage.* = .{ .id = 35 };
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 2), rt.after_sweep_calls);
+    try std.testing.expectEqual(@as(usize, 2), rt.finalized_at_last_after_sweep);
+    try std.testing.expect(!rt.after_sweep_under_alloc_lock);
+
+    heap.beginConcurrentMarkParallel();
+    heap.abortConcurrentMarkParallel();
+    try std.testing.expectEqual(@as(usize, 2), rt.after_sweep_calls);
+
+    const concurrent_garbage = try heap.create(TestRT.Node, .node);
+    concurrent_garbage.* = .{ .id = 36 };
+    heap.beginConcurrentMarkParallel();
+    while (!heap.concurrentMarkRound()) {}
+    try std.testing.expect(heap.finishConcurrentMarkParallel());
+    try std.testing.expectEqual(@as(usize, 3), rt.after_sweep_calls);
+    try std.testing.expectEqual(@as(usize, 3), rt.finalized_at_last_after_sweep);
+    try std.testing.expect(!rt.after_sweep_under_alloc_lock);
 }
 
 test "deinit finalizes every remaining cell" {
