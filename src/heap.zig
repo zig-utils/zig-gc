@@ -107,6 +107,7 @@ pub fn Heap(comptime Binding: type) type {
         pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         const min_retained_scratch_entries: usize = 4096;
+        const publication_shard_count = if (has_owned_cell_iterator) 64 else 0;
 
         /// One machine-word-ish header in front of every cell: the all-cells
         /// list link, the payload size (to free), the kind tag (to dispatch
@@ -163,6 +164,28 @@ pub fn Heap(comptime Binding: type) type {
             }
         };
 
+        const PublicationShard = struct {
+            owner: std.atomic.Value(usize) = .init(0),
+            active: std.atomic.Value(bool) = .init(false),
+            live_cells: usize = 0,
+            live_bytes: std.atomic.Value(usize) = .init(0),
+        };
+
+        // Keep independent mutator counters on separate cache lines. The
+        // binding's owned bitmap remains the authoritative cell walk; shards
+        // carry only aggregate deltas since the last collector fold.
+        const CacheAlignedPublicationShard = struct {
+            shard: PublicationShard = .{},
+            padding: [64 - @sizeOf(PublicationShard)]u8 = @splat(0),
+        };
+
+        const PublicationTotals = struct {
+            live_cells: usize = 0,
+            live_bytes: usize = 0,
+            young_cells: usize = 0,
+            young_bytes: usize = 0,
+        };
+
         /// Exact backing allocation size for a cell payload type. Embedders that
         /// claim all cells use owned storage use this in an exhaustive comptime
         /// proof over their cell taxonomy.
@@ -190,6 +213,13 @@ pub fn Heap(comptime Binding: type) type {
         /// lookup falls back to the all-list walk, preserving the same safety
         /// semantics for wild/stale pointers.
         payload_index: std.AutoHashMapUnmanaged(usize, *Header) = .empty,
+        /// Large owned batches may publish through one stable per-thread shard
+        /// without acquiring or modifying a heap-wide word. Collectors close
+        /// this read-mostly gate and drain active publishers before folding the
+        /// aggregate deltas. Marking keeps it closed and uses the proven global
+        /// born-grey path.
+        sharded_publication_gate: std.atomic.Value(bool) = .init(true),
+        publication_shards: [publication_shard_count]CacheAlignedPublicationShard = @splat(.{}),
         live_cells: usize = 0,
         bytes_live: usize = 0,
         /// Collect when `bytes_live` crosses this; reset to 2× live after a
@@ -283,6 +313,7 @@ pub fn Heap(comptime Binding: type) type {
         /// builds; keeping the field unconditional avoids changing Self's type
         /// between test declarations.
         alloc_lock_acquisitions_for_testing: usize = 0,
+        sharded_publications_for_testing: std.atomic.Value(usize) = .init(0),
         /// Address-sorted snapshot of live cell extents, used to answer interior
         /// pointer queries (`markConservativeWord`) in O(log n) instead of an
         /// O(n) walk of the `all` list per word. Built lazily on the first
@@ -459,6 +490,8 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(!self.marking.load(.acquire));
             if (self.parallel) self.lockAlloc();
             defer if (self.parallel) self.unlockAlloc();
+            const reopen_shards = self.closeAndFoldPublicationShards();
+            defer if (reopen_shards) self.reopenShardedPublication();
             if (!enabled and self.nursery_enabled and self.young_cells != 0)
                 self.tenureYoungPrefix();
             self.nursery_enabled = enabled;
@@ -481,6 +514,8 @@ pub fn Heap(comptime Binding: type) type {
         pub fn accounting(self: *Self) Accounting {
             if (self.syncAllocMetadata()) self.lockAlloc();
             defer if (self.syncAllocMetadata()) self.unlockAlloc();
+            const reopen_shards = self.closeAndFoldPublicationShards();
+            defer if (reopen_shards and !self.marking.load(.acquire)) self.reopenShardedPublication();
             return .{
                 .live_cells = self.live_cells,
                 .live_bytes = self.bytes_live,
@@ -577,6 +612,90 @@ pub fn Heap(comptime Binding: type) type {
 
         inline fn cellIterator(self: *Self) CellIterator {
             return CellIterator.init(self);
+        }
+
+        fn currentPublicationShard(self: *Self) ?*PublicationShard {
+            const thread_id: usize = @intCast(std.Thread.getCurrentId());
+            const owner = thread_id +% 1;
+            const token = if (owner == 0) std.math.maxInt(usize) else owner;
+            var empty: ?*PublicationShard = null;
+            for (&self.publication_shards) |*entry| {
+                const shard = &entry.shard;
+                const existing = shard.owner.load(.acquire);
+                if (existing == token) return shard;
+                if (existing == 0 and empty == null) empty = shard;
+            }
+            const shard = empty orelse return null;
+            if (shard.owner.cmpxchgStrong(0, token, .acq_rel, .acquire)) |existing| {
+                if (existing == token) return shard;
+                // Another first-use registration won this slot. Retry the
+                // bounded table so each OS thread keeps one stable shard.
+                return self.currentPublicationShard();
+            }
+            return shard;
+        }
+
+        fn beginShardedPublication(self: *Self, nursery_snapshot: bool) ?*PublicationShard {
+            if (!self.bindingEnumeratesOwnedCells()) return null;
+            if (!self.sharded_publication_gate.load(.seq_cst)) return null;
+            const shard = self.currentPublicationShard() orelse return null;
+            shard.active.store(true, .seq_cst);
+            if (!self.sharded_publication_gate.load(.seq_cst) or
+                self.marking.load(.acquire) or self.nursery_enabled != nursery_snapshot)
+            {
+                shard.active.store(false, .seq_cst);
+                return null;
+            }
+            return shard;
+        }
+
+        fn finishShardedPublication(self: *Self, shard: *PublicationShard, count: usize, bytes: usize) void {
+            shard.live_cells += count;
+            _ = shard.live_bytes.fetchAdd(bytes, .monotonic);
+            if (builtin.is_test) _ = self.sharded_publications_for_testing.fetchAdd(1, .monotonic);
+            shard.active.store(false, .seq_cst);
+        }
+
+        fn publicationTotals(self: *Self) PublicationTotals {
+            if (!self.bindingEnumeratesOwnedCells()) return .{};
+            var totals = PublicationTotals{};
+            for (&self.publication_shards) |*entry| {
+                const shard = &entry.shard;
+                totals.live_bytes += shard.live_bytes.load(.acquire);
+            }
+            if (self.nursery_enabled) {
+                totals.young_cells = totals.live_cells;
+                totals.young_bytes = totals.live_bytes;
+            }
+            return totals;
+        }
+
+        /// Stop new private publishers, wait for any batch that passed the gate,
+        /// and fold every shard exactly once. Sequentially consistent gate/
+        /// active handshakes close the "collector saw idle while publisher saw
+        /// open" race without any heap-wide publisher RMW.
+        fn closeAndFoldPublicationShards(self: *Self) bool {
+            if (!self.bindingEnumeratesOwnedCells()) return false;
+            const was_open = self.sharded_publication_gate.swap(false, .seq_cst);
+            for (&self.publication_shards) |*entry| {
+                const shard = &entry.shard;
+                while (shard.active.load(.seq_cst)) std.atomic.spinLoopHint();
+                const cells = shard.live_cells;
+                shard.live_cells = 0;
+                const bytes = shard.live_bytes.swap(0, .acq_rel);
+                self.live_cells += cells;
+                self.bytes_live += bytes;
+                if (self.nursery_enabled) {
+                    self.young_cells += cells;
+                    self.young_bytes += bytes;
+                }
+            }
+            return was_open;
+        }
+
+        inline fn reopenShardedPublication(self: *Self) void {
+            if (self.bindingEnumeratesOwnedCells())
+                self.sharded_publication_gate.store(true, .seq_cst);
         }
 
         inline fn bindingPublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
@@ -864,6 +983,25 @@ pub fn Heap(comptime Binding: type) type {
             const owned_fast_path = self.bindingAllCellsUseOwnedStorage() and out.len >= 64;
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             const nursery_snapshot = self.nursery_enabled;
+            if (owned_fast_path) {
+                if (self.beginShardedPublication(nursery_snapshot)) |shard| {
+                    for (out) |payload| {
+                        const h = headerOf(payload);
+                        h.magic = header_magic;
+                        h.next = null;
+                        h.size = @sizeOf(T);
+                        h.kind = kind;
+                        @atomicStore(bool, &h.marked, false, .release);
+                        @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                        @atomicStore(bool, &h.remembered_owner, false, .release);
+                        @atomicStore(bool, &h.remembered_target, false, .release);
+                    }
+                    const raw: []*anyopaque = @as([*]*anyopaque, @ptrCast(out.ptr))[0..out.len];
+                    self.bindingPublishCellAllocationBatch(raw, total, header_stride);
+                    self.finishShardedPublication(shard, out.len, total * out.len);
+                    return out.len;
+                }
+            }
             var private_head: ?*Header = null;
             var private_tail: ?*Header = null;
             if (owned_fast_path and !self.marking.load(.acquire)) {
@@ -929,7 +1067,7 @@ pub fn Heap(comptime Binding: type) type {
         pub fn maybeCollect(self: *Self) void {
             if (self.nursery_enabled and self.shouldCollectYoung()) {
                 self.collectYoung();
-            } else if (self.bytes_live >= self.threshold_bytes) {
+            } else if (self.shouldCollect()) {
                 self.collect();
             }
         }
@@ -1114,6 +1252,7 @@ pub fn Heap(comptime Binding: type) type {
         /// mutator then runs between `markStep`s with the `writeBarrier` active.
         pub fn startMarking(self: *Self) void {
             self.collection_kind = .full;
+            _ = self.closeAndFoldPublicationShards();
             var it = self.cellIterator();
             while (it.next()) |h| h.marked = false;
             self.marked_count = 0;
@@ -1180,6 +1319,7 @@ pub fn Heap(comptime Binding: type) type {
             }
             self.marking.store(false, .release);
             self.sweepPhase(&v);
+            self.reopenShardedPublication();
         }
 
         /// A full stop-the-world cycle: mark from roots, clear dead weak edges,
@@ -1198,13 +1338,15 @@ pub fn Heap(comptime Binding: type) type {
         pub fn collectYoung(self: *Self) void {
             std.debug.assert(!self.marking.load(.acquire));
             std.debug.assert(!self.concurrent.load(.acquire));
-            if (!self.nursery_enabled or self.young_cells == 0) return;
+            if (!self.nursery_enabled) return;
+            if (self.young_cells + self.publicationTotals().young_cells == 0) return;
             if (self.nursery_force_full.load(.acquire)) {
                 self.collect();
                 return;
             }
 
             if (self.parallel) self.lockAlloc();
+            _ = self.closeAndFoldPublicationShards();
             self.collection_kind = .minor;
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             var old_head: ?*Header = null;
@@ -1270,6 +1412,7 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.sweepPhase(&v);
             self.collection_kind = .full;
+            self.reopenShardedPublication();
         }
 
         // ---- Concurrent marking (M3) -------------------------------------
@@ -1333,6 +1476,7 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(self.parallel);
             self.collection_kind = .full;
             self.lockAlloc();
+            _ = self.closeAndFoldPublicationShards();
             var it = self.cellIterator();
             // Atomic store: a lagging peer's `claimMark` CAS (barrier path, no
             // `alloc_lock`) can touch the same `marked` byte concurrently. See
@@ -1416,6 +1560,7 @@ pub fn Heap(comptime Binding: type) type {
             }
             self.marking.store(false, .release);
             self.sweepPhase(&v);
+            self.reopenShardedPublication();
         }
 
         /// Pending mutator-allocated cells not yet folded into the mark (M3
@@ -1506,6 +1651,7 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.concurrent.store(false, .release);
             self.sweepPhaseLocked(&v); // alloc_lock already held
+            self.reopenShardedPublication();
             self.unlockAlloc();
             return true;
         }
@@ -1516,7 +1662,8 @@ pub fn Heap(comptime Binding: type) type {
         pub fn shouldCollect(self: *Self) bool {
             if (self.parallel) self.lockAlloc();
             defer if (self.parallel) self.unlockAlloc();
-            return self.bytes_live >= self.threshold_bytes;
+            const pending = self.publicationTotals();
+            return self.bytes_live + pending.live_bytes >= self.threshold_bytes;
         }
 
         /// Whether tenured bytes alone have crossed the full-heap threshold.
@@ -1527,7 +1674,8 @@ pub fn Heap(comptime Binding: type) type {
         pub fn shouldCollectOld(self: *Self) bool {
             if (self.parallel) self.lockAlloc();
             defer if (self.parallel) self.unlockAlloc();
-            return self.bytes_live - self.young_bytes >= self.threshold_bytes;
+            const pending = self.publicationTotals();
+            return (self.bytes_live + pending.live_bytes) - (self.young_bytes + pending.young_bytes) >= self.threshold_bytes;
         }
 
         /// Whether the nursery has reached its collection threshold, or a
@@ -1538,7 +1686,8 @@ pub fn Heap(comptime Binding: type) type {
             if (self.nursery_force_full.load(.acquire)) return true;
             if (self.parallel) self.lockAlloc();
             defer if (self.parallel) self.unlockAlloc();
-            return self.young_bytes >= self.nursery_threshold_bytes;
+            const pending = self.publicationTotals();
+            return self.young_bytes + pending.young_bytes >= self.nursery_threshold_bytes;
         }
 
         /// Abort an in-progress parallel concurrent mark WITHOUT sweeping: clear
@@ -1559,6 +1708,7 @@ pub fn Heap(comptime Binding: type) type {
             self.unlockAlloc();
             self.mark_stack.clearRetainingCapacity();
             self.deferred_trace.clearRetainingCapacity();
+            self.reopenShardedPublication();
         }
 
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
@@ -1794,6 +1944,7 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn deinitImpl(self: *Self, free_cell_storage: bool) void {
+            _ = self.closeAndFoldPublicationShards();
             var cells = self.cellIterator();
             while (cells.next()) |h| {
                 self.bindingUnpublishCellAllocation(h, header_stride + h.size);
@@ -1938,6 +2089,95 @@ const BatchAllocTestRT = struct {
     pub fn traceRoots(_: *BatchAllocTestRT, _: anytype) void {}
     pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
     pub fn finalize(_: *BatchAllocTestRT, _: *anyopaque, _: Kind) void {}
+};
+
+const ShardedBatchTestRT = struct {
+    pub const Kind = enum { node };
+    const Node = struct { id: usize = 0 };
+    const max_cells = 4096;
+
+    published: [max_cells]std.atomic.Value(?*anyopaque) = @splat(.init(null)),
+    next_published: std.atomic.Value(usize) = .init(0),
+    pause_allocate: std.atomic.Value(bool) = .init(false),
+    allocate_ready: std.atomic.Value(bool) = .init(false),
+    release_allocate: std.atomic.Value(bool) = .init(false),
+    pause_publish: std.atomic.Value(bool) = .init(false),
+    publish_ready: std.atomic.Value(bool) = .init(false),
+    release_publish: std.atomic.Value(bool) = .init(false),
+
+    pub const Iterator = struct {
+        rt: *ShardedBatchTestRT,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) ?*anyopaque {
+            while (self.index < self.rt.published.len) {
+                const index = self.index;
+                self.index += 1;
+                if (self.rt.published[index].load(.acquire)) |allocation| return allocation;
+            }
+            return null;
+        }
+    };
+
+    pub fn ownedCellIterator(self: *ShardedBatchTestRT) Iterator {
+        return .{ .rt = self };
+    }
+    pub fn allCellsUseOwnedStorage(_: *ShardedBatchTestRT) bool {
+        return true;
+    }
+    pub fn usesOwnedCellStorage(_: *ShardedBatchTestRT, _: usize) bool {
+        return true;
+    }
+    pub fn allocateCellBatch(self: *ShardedBatchTestRT, total: usize, out: []*anyopaque) usize {
+        var allocated: usize = 0;
+        while (allocated < out.len) : (allocated += 1) {
+            const slab = std.heap.page_allocator.alignedAlloc(u8, .@"16", total) catch break;
+            out[allocated] = @ptrCast(slab.ptr);
+        }
+        if (self.pause_allocate.load(.acquire)) {
+            self.allocate_ready.store(true, .release);
+            while (!self.release_allocate.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        return allocated;
+    }
+    pub fn publishCellAllocation(self: *ShardedBatchTestRT, allocation: *anyopaque, _: usize) void {
+        const index = self.next_published.fetchAdd(1, .monotonic);
+        std.debug.assert(index < self.published.len);
+        self.published[index].store(allocation, .release);
+    }
+    pub fn publishCellAllocationBatch(self: *ShardedBatchTestRT, payloads: []*anyopaque, _: usize, payload_offset: usize) void {
+        if (self.pause_publish.load(.acquire)) {
+            self.publish_ready.store(true, .release);
+            while (!self.release_publish.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        const start = self.next_published.fetchAdd(payloads.len, .monotonic);
+        std.debug.assert(start + payloads.len <= self.published.len);
+        for (payloads, 0..) |payload, i| {
+            const allocation: *anyopaque = @ptrFromInt(@intFromPtr(payload) - payload_offset);
+            self.published[start + i].store(allocation, .release);
+        }
+    }
+    pub fn unpublishCellAllocation(self: *ShardedBatchTestRT, allocation: *anyopaque, _: usize) void {
+        for (&self.published) |*slot| {
+            if (slot.load(.acquire) == allocation) {
+                if (slot.cmpxchgStrong(allocation, null, .acq_rel, .acquire) == null) return;
+            }
+        }
+        unreachable;
+    }
+    pub fn ownsCellAllocation(self: *ShardedBatchTestRT, allocation: *anyopaque) bool {
+        for (&self.published) |*slot| if (slot.load(.acquire) == allocation) return true;
+        return false;
+    }
+    pub fn freeCellStorageBatch(_: *ShardedBatchTestRT, total: usize, allocations: []*anyopaque) void {
+        for (allocations) |allocation| {
+            const base: [*]align(16) u8 = @ptrCast(@alignCast(allocation));
+            std.heap.page_allocator.free(base[0..total]);
+        }
+    }
+    pub fn traceRoots(_: *ShardedBatchTestRT, _: anytype) void {}
+    pub fn trace(_: *anyopaque, _: Kind, _: anytype) void {}
+    pub fn finalize(_: *ShardedBatchTestRT, _: *anyopaque, _: Kind) void {}
 };
 
 const SweepBatchTestRT = struct {
@@ -3388,6 +3628,125 @@ test "large owned createBatch splices before publishing outside the allocation l
     try std.testing.expectEqual(nodes[nodes.len - 1], @as(*N, @ptrCast(@alignCast(H.payloadOf(heap.all.?)))));
     try std.testing.expectEqual(nodes.len, heap.live_cells);
     try std.testing.expectEqual(nodes.len, heap.young_cells);
+}
+
+test "parallel owned batches publish through private aggregate shards" {
+    var rt = ShardedBatchTestRT{};
+    const H = Heap(ShardedBatchTestRT);
+    var heap = H.init(std.heap.page_allocator, &rt);
+    heap.setNurseryEnabled(true);
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const threads = 8;
+    const batches_per_thread = 8;
+    const batch_size = 64;
+    const Worker = struct {
+        heap: *H,
+        lane: usize,
+
+        fn run(self: *@This()) void {
+            var nodes: [batch_size]*ShardedBatchTestRT.Node = undefined;
+            for (0..batches_per_thread) |batch| {
+                const count = self.heap.createBatch(ShardedBatchTestRT.Node, .node, &nodes) catch unreachable;
+                std.debug.assert(count == nodes.len);
+                for (nodes, 0..) |node, i| node.* = .{ .id = self.lane * 10_000 + batch * batch_size + i };
+            }
+        }
+    };
+    var workers: [threads]Worker = undefined;
+    var pool: [threads]std.Thread = undefined;
+    for (&pool, &workers, 0..) |*thread, *worker, lane| {
+        worker.* = .{ .heap = &heap, .lane = lane };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    for (&pool) |*thread| thread.join();
+
+    const expected = threads * batches_per_thread * batch_size;
+    try std.testing.expectEqual(@as(usize, 0), heap.alloc_lock_acquisitions_for_testing);
+    try std.testing.expectEqual(@as(usize, threads * batches_per_thread), heap.sharded_publications_for_testing.load(.monotonic));
+    try std.testing.expectEqual(@as(?*H.Header, null), heap.all);
+    const before = heap.accounting();
+    try std.testing.expectEqual(@as(usize, expected), before.live_cells);
+    try std.testing.expectEqual(expected * H.cellAllocationBytes(ShardedBatchTestRT.Node), before.live_bytes);
+
+    heap.collectYoung();
+    const after = heap.accounting();
+    try std.testing.expectEqual(@as(usize, 0), after.live_cells);
+    for (&rt.published) |*slot| try std.testing.expectEqual(@as(?*anyopaque, null), slot.load(.acquire));
+}
+
+test "parallel mark closes sharded publication before and after header publication" {
+    var rt = ShardedBatchTestRT{};
+    const H = Heap(ShardedBatchTestRT);
+    var heap = H.init(std.heap.page_allocator, &rt);
+    heap.setNurseryEnabled(true);
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const batch_size = 64;
+    const Publisher = struct {
+        heap: *H,
+        base: usize,
+
+        fn run(self: *@This()) void {
+            var nodes: [batch_size]*ShardedBatchTestRT.Node = undefined;
+            const count = self.heap.createBatch(ShardedBatchTestRT.Node, .node, &nodes) catch unreachable;
+            std.debug.assert(count == nodes.len);
+            for (nodes, 0..) |node, i| node.* = .{ .id = self.base + i };
+        }
+    };
+    const waitFor = struct {
+        fn flag(value: *std.atomic.Value(bool)) void {
+            while (!value.load(.acquire)) std.Thread.yield() catch {};
+        }
+    }.flag;
+
+    // Raw reservations stay absent from the iterator. Once marking closes the
+    // shard gate, the resumed publisher takes the existing born-grey fallback.
+    rt.pause_allocate.store(true, .release);
+    var raw_publisher = Publisher{ .heap = &heap, .base = 1000 };
+    const raw_thread = try std.Thread.spawn(.{}, Publisher.run, .{&raw_publisher});
+    waitFor(&rt.allocate_ready);
+    heap.beginConcurrentMarkParallel();
+    rt.release_allocate.store(true, .release);
+    raw_thread.join();
+    heap.abortConcurrentMarkParallel();
+    try std.testing.expectEqual(@as(usize, batch_size), heap.accounting().live_cells);
+    heap.collectYoung();
+
+    // This publisher has initialized every header and is stopped immediately
+    // before bitmap publication. The collector must observe its active shard
+    // and cannot complete begin/whitening until publication and counters land.
+    rt.pause_allocate.store(false, .release);
+    rt.pause_publish.store(true, .release);
+    var header_publisher = Publisher{ .heap = &heap, .base = 2000 };
+    const header_thread = try std.Thread.spawn(.{}, Publisher.run, .{&header_publisher});
+    waitFor(&rt.publish_ready);
+
+    const Collector = struct {
+        heap: *H,
+        started: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.heap.beginConcurrentMarkParallel();
+            self.completed.store(true, .release);
+        }
+    };
+    var collector = Collector{ .heap = &heap };
+    const collector_thread = try std.Thread.spawn(.{}, Collector.run, .{&collector});
+    waitFor(&collector.started);
+    while (heap.sharded_publication_gate.load(.seq_cst)) std.Thread.yield() catch {};
+    try std.testing.expect(!collector.completed.load(.acquire));
+    rt.release_publish.store(true, .release);
+    header_thread.join();
+    collector_thread.join();
+    try std.testing.expect(collector.completed.load(.acquire));
+    heap.abortConcurrentMarkParallel();
+    try std.testing.expectEqual(@as(usize, batch_size), heap.accounting().live_cells);
+    heap.collectYoung();
 }
 
 test "createBatch falls back normally when the embedder batch is empty" {

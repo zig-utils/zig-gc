@@ -113,6 +113,11 @@ semantics. `ownedCellIterator` is consumed only at a quiescent collection or
 teardown boundary (or while publication is excluded); it must yield every
 published allocation base exactly once and exclude private or reclaimed slots.
 When present, it also replaces the collector's intrusive all-cells list.
+Large owned batches then publish aggregate live/nursery deltas through stable
+per-thread cache-line shards: publishers only read the heap gate and update
+their own shard, while a collector closes the gate, drains active publishers,
+and folds all deltas once before marking. Active marking retains the serialized
+born-grey path.
 
 ## Usage
 
