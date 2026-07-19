@@ -25,6 +25,7 @@
 //!   fn publishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!   fn publishCellAllocationBatch(ctx: *B, payloads: []*anyopaque, total: usize, payload_offset: usize) void;
 //!   fn unpublishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
+//!   fn ownedCellIterator(ctx: *B) Iterator; // Iterator.next() ?*anyopaque
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -98,6 +99,11 @@ pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
         pub const Kind = Binding.Kind;
+        const has_owned_cell_iterator = @hasDecl(Binding, "ownedCellIterator");
+        const OwnedCellIterator = if (has_owned_cell_iterator)
+            @typeInfo(@TypeOf(Binding.ownedCellIterator)).@"fn".return_type.?
+        else
+            void;
         pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         const min_retained_scratch_entries: usize = 4096;
@@ -122,6 +128,40 @@ pub fn Heap(comptime Binding: type) type {
         /// correctly aligned, and `payload - header_stride` recovers the header
         /// in O(1) regardless of cell type.
         const header_stride = std.mem.alignForward(usize, @sizeOf(Header), 16);
+
+        /// Uniform heap walk. Exact owned-storage bindings enumerate their
+        /// published slots in slab order; every other binding retains the
+        /// intrusive-list fallback. Owned iteration is only requested at a
+        /// heap-quiescent boundary or while `alloc_lock` excludes publication.
+        const CellIterator = struct {
+            heap: *Self,
+            intrusive: ?*Header,
+            owned: OwnedCellIterator = undefined,
+            use_owned: bool = false,
+
+            fn init(heap: *Self) @This() {
+                var result = @This(){ .heap = heap, .intrusive = heap.all };
+                if (comptime has_owned_cell_iterator) {
+                    if (heap.bindingAllCellsUseOwnedStorage()) {
+                        result.owned = Binding.ownedCellIterator(heap.ctx);
+                        result.use_owned = true;
+                    }
+                }
+                return result;
+            }
+
+            fn next(self: *@This()) ?*Header {
+                if (comptime has_owned_cell_iterator) {
+                    if (self.use_owned) {
+                        const allocation = self.owned.next() orelse return null;
+                        return @ptrCast(@alignCast(allocation));
+                    }
+                }
+                const header = self.intrusive orelse return null;
+                self.intrusive = header.next;
+                return header;
+            }
+        };
 
         /// Exact backing allocation size for a cell payload type. Embedders that
         /// claim all cells use owned storage use this in an exhaustive comptime
@@ -454,13 +494,16 @@ pub fn Heap(comptime Binding: type) type {
         fn tenureYoungPrefix(self: *Self) void {
             var promoted_cells: usize = 0;
             var promoted_bytes: usize = 0;
-            var it = self.all;
-            while (it) |h| {
-                if (!@atomicLoad(bool, &h.young, .monotonic)) break;
+            const owned_enumeration = self.bindingEnumeratesOwnedCells();
+            var it = self.cellIterator();
+            while (it.next()) |h| {
+                if (!@atomicLoad(bool, &h.young, .monotonic)) {
+                    if (owned_enumeration) continue;
+                    break;
+                }
                 @atomicStore(bool, &h.young, false, .release);
                 promoted_cells += 1;
                 promoted_bytes += header_stride + h.size;
-                it = h.next;
             }
             std.debug.assert(promoted_cells == self.young_cells);
             std.debug.assert(promoted_bytes == self.young_bytes);
@@ -527,6 +570,15 @@ pub fn Heap(comptime Binding: type) type {
             return false;
         }
 
+        inline fn bindingEnumeratesOwnedCells(self: *Self) bool {
+            if (comptime !has_owned_cell_iterator) return false;
+            return self.bindingAllCellsUseOwnedStorage();
+        }
+
+        inline fn cellIterator(self: *Self) CellIterator {
+            return CellIterator.init(self);
+        }
+
         inline fn bindingPublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
             if (@hasDecl(Binding, "publishCellAllocation"))
                 self.ctx.publishCellAllocation(allocation, total);
@@ -553,8 +605,8 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn headerForPayloadSlowLocked(self: *Self, payload: *anyopaque) ?*Header {
-            var it = self.all;
-            while (it) |h| : (it = h.next) {
+            var it = self.cellIterator();
+            while (it.next()) |h| {
                 if (payloadOf(h) == payload) return h;
             }
             return null;
@@ -634,8 +686,8 @@ pub fn Heap(comptime Binding: type) type {
             if (self.syncAllocMetadata()) self.lockAlloc();
             defer if (self.syncAllocMetadata()) self.unlockAlloc();
             self.addr_index.clearRetainingCapacity();
-            var it = self.all;
-            while (it) |h| : (it = h.next) {
+            var it = self.cellIterator();
+            while (it.next()) |h| {
                 const start = @intFromPtr(payloadOf(h));
                 // A zero-size payload would make an empty extent that no interior
                 // address can fall into; record at least one byte so an exact
@@ -687,7 +739,8 @@ pub fn Heap(comptime Binding: type) type {
             // `magic`/`next`/`size`/`kind` are only read at that finish (or by
             // sweep under `alloc_lock`), so they need no atomic.
             h.magic = header_magic;
-            h.next = self.all;
+            const owned_enumeration = self.bindingEnumeratesOwnedCells();
+            h.next = if (owned_enumeration) null else self.all;
             h.size = @sizeOf(T);
             h.kind = kind;
             @atomicStore(bool, &h.marked, born_grey, .release);
@@ -698,7 +751,7 @@ pub fn Heap(comptime Binding: type) type {
             // initialized. Publish only after every field is complete so its
             // classifier's synchronization makes later header reads race-free.
             if (publish_binding) self.bindingPublishCellAllocation(h, total);
-            self.all = h;
+            if (!owned_enumeration) self.all = h;
             self.indexPayloadLocked(h);
             self.live_cells += 1;
             self.bytes_live += total;
@@ -809,6 +862,7 @@ pub fn Heap(comptime Binding: type) type {
             // lock hold is already small, while building a second private
             // chain adds work without relieving meaningful contention.
             const owned_fast_path = self.bindingAllCellsUseOwnedStorage() and out.len >= 64;
+            const owned_enumeration = self.bindingEnumeratesOwnedCells();
             const nursery_snapshot = self.nursery_enabled;
             var private_head: ?*Header = null;
             var private_tail: ?*Header = null;
@@ -816,22 +870,26 @@ pub fn Heap(comptime Binding: type) type {
                 for (out) |payload| {
                     const h = headerOf(payload);
                     h.magic = header_magic;
-                    h.next = private_head;
+                    h.next = if (owned_enumeration) null else private_head;
                     h.size = @sizeOf(T);
                     h.kind = kind;
                     @atomicStore(bool, &h.marked, false, .release);
                     @atomicStore(bool, &h.young, nursery_snapshot, .release);
                     @atomicStore(bool, &h.remembered_owner, false, .release);
                     @atomicStore(bool, &h.remembered_target, false, .release);
-                    if (private_tail == null) private_tail = h;
-                    private_head = h;
+                    if (!owned_enumeration) {
+                        if (private_tail == null) private_tail = h;
+                        private_head = h;
+                    }
                 }
             }
 
             if (self.syncAllocMetadata()) self.lockAlloc();
-            if (private_head != null and !self.marking.load(.acquire) and self.nursery_enabled == nursery_snapshot) {
-                private_tail.?.next = self.all;
-                self.all = private_head;
+            if (owned_fast_path and !self.marking.load(.acquire) and self.nursery_enabled == nursery_snapshot) {
+                if (!owned_enumeration) {
+                    private_tail.?.next = self.all;
+                    self.all = private_head;
+                }
                 self.live_cells += out.len;
                 self.bytes_live += total * out.len;
                 if (nursery_snapshot) {
@@ -1056,8 +1114,8 @@ pub fn Heap(comptime Binding: type) type {
         /// mutator then runs between `markStep`s with the `writeBarrier` active.
         pub fn startMarking(self: *Self) void {
             self.collection_kind = .full;
-            var it = self.all;
-            while (it) |h| : (it = h.next) h.marked = false;
+            var it = self.cellIterator();
+            while (it.next()) |h| h.marked = false;
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             // Reserve the mark stack to the live-cell count up front — the grey
@@ -1148,11 +1206,21 @@ pub fn Heap(comptime Binding: type) type {
 
             if (self.parallel) self.lockAlloc();
             self.collection_kind = .minor;
-            var old_head = self.all;
-            while (old_head) |h| {
-                if (!@atomicLoad(bool, &h.young, .monotonic)) break;
-                @atomicStore(bool, &h.marked, false, .monotonic);
-                old_head = h.next;
+            const owned_enumeration = self.bindingEnumeratesOwnedCells();
+            var old_head: ?*Header = null;
+            if (owned_enumeration) {
+                var cells = self.cellIterator();
+                while (cells.next()) |h| {
+                    if (@atomicLoad(bool, &h.young, .monotonic))
+                        @atomicStore(bool, &h.marked, false, .monotonic);
+                }
+            } else {
+                old_head = self.all;
+                while (old_head) |h| {
+                    if (!@atomicLoad(bool, &h.young, .monotonic)) break;
+                    @atomicStore(bool, &h.marked, false, .monotonic);
+                    old_head = h.next;
+                }
             }
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
@@ -1178,9 +1246,17 @@ pub fn Heap(comptime Binding: type) type {
             // so this adds only a kind check per old cell and traces edges solely
             // for the selected kinds.
             if (@hasDecl(Binding, "traceOldOnMinor")) {
-                var old_it = old_head;
-                while (old_it) |h| : (old_it = h.next) {
-                    if (Binding.traceOldOnMinor(h.kind)) self.rememberOwner(h);
+                if (owned_enumeration) {
+                    var old_it = self.cellIterator();
+                    while (old_it.next()) |h| {
+                        if (!@atomicLoad(bool, &h.young, .monotonic) and Binding.traceOldOnMinor(h.kind))
+                            self.rememberOwner(h);
+                    }
+                } else {
+                    var old_it = old_head;
+                    while (old_it) |h| : (old_it = h.next) {
+                        if (Binding.traceOldOnMinor(h.kind)) self.rememberOwner(h);
+                    }
                 }
             }
             self.lockRemember();
@@ -1257,11 +1333,11 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(self.parallel);
             self.collection_kind = .full;
             self.lockAlloc();
-            var it = self.all;
+            var it = self.cellIterator();
             // Atomic store: a lagging peer's `claimMark` CAS (barrier path, no
             // `alloc_lock`) can touch the same `marked` byte concurrently. See
             // the whiten note in the doc comment above.
-            while (it) |h| : (it = h.next) @atomicStore(bool, &h.marked, false, .monotonic);
+            while (it.next()) |h| @atomicStore(bool, &h.marked, false, .monotonic);
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             // Pre-reserve the mark stack to the live-cell count (see the note in
@@ -1528,8 +1604,8 @@ pub fn Heap(comptime Binding: type) type {
                 if (@hasDecl(Binding, "traceEphemeron")) {
                     while (true) {
                         const before = self.marked_count;
-                        var eit = self.all;
-                        while (eit) |h| : (eit = h.next) {
+                        var eit = self.cellIterator();
+                        while (eit.next()) |h| {
                             if (self.shouldProcessMarkedCell(h)) Binding.traceEphemeron(self.ctx, payloadOf(h), h.kind, v);
                         }
                         while (self.mark_stack.pop()) |h| {
@@ -1562,8 +1638,8 @@ pub fn Heap(comptime Binding: type) type {
                 if (@hasDecl(Binding, "afterWeakRoots")) Binding.afterWeakRoots(self.ctx);
 
                 if (@hasDecl(Binding, "afterWeak")) {
-                    var wit = self.all;
-                    while (wit) |h| : (wit = h.next) {
+                    var wit = self.cellIterator();
+                    while (wit.next()) |h| {
                         if (self.shouldProcessMarkedCell(h)) Binding.afterWeak(self.ctx, payloadOf(h), h.kind);
                     }
                 }
@@ -1582,10 +1658,14 @@ pub fn Heap(comptime Binding: type) type {
             var release_batch_len: usize = 0;
             var release_batch_bytes: usize = 0;
             var prev: ?*Header = null;
-            var cur = self.all;
-            while (cur) |h| {
+            const owned_enumeration = self.bindingEnumeratesOwnedCells();
+            var cells = self.cellIterator();
+            while (cells.next()) |h| {
                 const young = @atomicLoad(bool, &h.young, .monotonic);
-                if (minor and !young) break;
+                if (minor and !young) {
+                    if (owned_enumeration) continue;
+                    break;
+                }
                 const next = h.next;
                 const total = header_stride + h.size;
                 if (minor and young) cycle_young_bytes += total;
@@ -1606,7 +1686,9 @@ pub fn Heap(comptime Binding: type) type {
                     // witness before returning storage so a stale payload cannot
                     // pass the optional ownership hook.
                     h.magic = 0;
-                    if (prev) |p| p.next = next else self.all = next;
+                    if (!owned_enumeration) {
+                        if (prev) |p| p.next = next else self.all = next;
+                    }
                     cycle_reclaimed_cells += 1;
                     cycle_reclaimed_bytes += total;
                     if (young) {
@@ -1629,7 +1711,6 @@ pub fn Heap(comptime Binding: type) type {
                         self.backing.free(base[0..total]);
                     }
                 }
-                cur = next;
             }
             if (@hasDecl(Binding, "freeCellStorageBatch") and release_batch_len != 0)
                 Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, release_batch[0..release_batch_len]);
@@ -1713,9 +1794,8 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn deinitImpl(self: *Self, free_cell_storage: bool) void {
-            var cur = self.all;
-            while (cur) |h| {
-                const next = h.next;
+            var cells = self.cellIterator();
+            while (cells.next()) |h| {
                 self.bindingUnpublishCellAllocation(h, header_stride + h.size);
                 Binding.finalize(self.ctx, payloadOf(h), h.kind);
                 if (free_cell_storage) {
@@ -1723,7 +1803,6 @@ pub fn Heap(comptime Binding: type) type {
                     const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
                     self.backing.free(base[0..total]);
                 }
-                cur = next;
             }
             self.all = null;
             self.payload_index.deinit(self.backing);
@@ -1937,6 +2016,82 @@ const OwnedCellTestRT = struct {
     }
     pub fn allCellsUseOwnedStorage(_: *OwnedCellTestRT) bool {
         return true;
+    }
+};
+
+const OwnedIterationTestRT = struct {
+    pub const Kind = enum { node };
+    const Node = struct {
+        id: u32 = 0,
+        strong: ?*Node = null,
+        weak: ?*anyopaque = null,
+    };
+
+    roots: [2]?*Node = .{ null, null },
+    published: [16]?*anyopaque = @splat(null),
+    finalized: [16]u32 = @splat(0),
+    finalized_len: usize = 0,
+
+    pub const Iterator = struct {
+        rt: *OwnedIterationTestRT,
+        index: usize = 0,
+
+        pub fn next(self: *Iterator) ?*anyopaque {
+            while (self.index < self.rt.published.len) {
+                const index = self.index;
+                self.index += 1;
+                if (self.rt.published[index]) |allocation| return allocation;
+            }
+            return null;
+        }
+    };
+
+    pub fn ownedCellIterator(self: *OwnedIterationTestRT) Iterator {
+        return .{ .rt = self };
+    }
+    pub fn allCellsUseOwnedStorage(_: *OwnedIterationTestRT) bool {
+        return true;
+    }
+    pub fn usesOwnedCellStorage(_: *OwnedIterationTestRT, _: usize) bool {
+        return true;
+    }
+    pub fn ownsCellAllocation(self: *OwnedIterationTestRT, allocation: *anyopaque) bool {
+        for (self.published) |candidate| if (candidate == allocation) return true;
+        return false;
+    }
+    pub fn publishCellAllocation(self: *OwnedIterationTestRT, allocation: *anyopaque, _: usize) void {
+        for (&self.published) |*slot| {
+            if (slot.* == null) {
+                slot.* = allocation;
+                return;
+            }
+        }
+        unreachable;
+    }
+    pub fn unpublishCellAllocation(self: *OwnedIterationTestRT, allocation: *anyopaque, _: usize) void {
+        for (&self.published) |*slot| {
+            if (slot.* == allocation) {
+                slot.* = null;
+                return;
+            }
+        }
+        unreachable;
+    }
+    pub fn traceRoots(self: *OwnedIterationTestRT, v: anytype) void {
+        for (self.roots) |root| v.mark(root);
+    }
+    pub fn trace(cell: *anyopaque, _: Kind, v: anytype) void {
+        const node: *Node = @ptrCast(@alignCast(cell));
+        v.mark(node.strong);
+        v.markWeak(&node.weak);
+    }
+    pub fn traceOldOnMinor(_: Kind) bool {
+        return true;
+    }
+    pub fn finalize(self: *OwnedIterationTestRT, cell: *anyopaque, _: Kind) void {
+        const node: *Node = @ptrCast(@alignCast(cell));
+        self.finalized[self.finalized_len] = node.id;
+        self.finalized_len += 1;
     }
 };
 
@@ -2557,6 +2712,46 @@ test "owned conservative classification skips the generic address index" {
     try std.testing.expect(rt.classify_calls >= words.len);
     try std.testing.expect(!heap.addr_index_built);
     try std.testing.expectEqual(@as(usize, 0), heap.addr_index.items.len);
+}
+
+test "owned cell iteration replaces intrusive publication across minor and full sweeps" {
+    const a = std.testing.allocator;
+    const H = Heap(OwnedIterationTestRT);
+    var rt = OwnedIterationTestRT{};
+    var heap = H.init(a, &rt);
+    heap.setNurseryEnabled(true);
+
+    const old = try heap.create(OwnedIterationTestRT.Node, .node);
+    old.* = .{ .id = 1 };
+    rt.roots[0] = old;
+    try std.testing.expectEqual(@as(?*H.Header, null), heap.all);
+    heap.collectYoung();
+
+    const live = try heap.create(OwnedIterationTestRT.Node, .node);
+    live.* = .{ .id = 2 };
+    const garbage = try heap.create(OwnedIterationTestRT.Node, .node);
+    garbage.* = .{ .id = 3 };
+    old.weak = garbage;
+    rt.roots[1] = live;
+    heap.collectYoung();
+
+    try std.testing.expectEqual(@as(?*H.Header, null), heap.all);
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(?*anyopaque, null), old.weak);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized_len);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized[0]);
+
+    rt.roots = .{ null, null };
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    for (rt.published) |allocation| try std.testing.expectEqual(@as(?*anyopaque, null), allocation);
+
+    const teardown = try heap.create(OwnedIterationTestRT.Node, .node);
+    teardown.* = .{ .id = 4 };
+    try std.testing.expectEqual(@as(?*H.Header, null), heap.all);
+    heap.deinit();
+    try std.testing.expectEqual(@as(usize, 4), rt.finalized_len);
+    for (rt.published) |allocation| try std.testing.expectEqual(@as(?*anyopaque, null), allocation);
 }
 
 const EphRT = struct {

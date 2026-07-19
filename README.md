@@ -100,6 +100,7 @@ fn publishCellAllocationBatch(
     total: usize,
     payload_offset: usize,
 ) void;
+fn ownedCellIterator(ctx: *B) Iterator; // Iterator.next() ?*anyopaque
 ```
 
 For batches of at least 64 cells while marking is inactive, `zig-gc` initializes
@@ -108,7 +109,10 @@ splices the chain and updates its counters in O(1), then releases that lock
 before the binding publishes its ownership bitmap. Payloads remain private
 until `createBatch` returns. Short batches, a changed nursery mode, and active
 marking retain the compact per-cell publication path, including born-grey
-semantics.
+semantics. `ownedCellIterator` is consumed only at a quiescent collection or
+teardown boundary (or while publication is excluded); it must yield every
+published allocation base exactly once and exclude private or reclaimed slots.
+When present, it also replaces the collector's intrusive all-cells list.
 
 ## Usage
 
