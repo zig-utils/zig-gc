@@ -178,6 +178,8 @@ const gc = @import("gc");
 var rt = MyRuntime{};                 // holds your roots + finalizer state
 var heap = gc.Heap(MyRuntime).init(allocator, &rt);
 defer heap.deinit();                  // frees + finalizes everything left
+heap.setNurseryTenuringAge(3);        // retain survivors for three minor cycles
+heap.setNurseryEnabled(true);
 
 const obj = try heap.create(MyObject, .object); // uninitialized payload
 obj.* = .{ ... };                      // initialize before the next safepoint
@@ -189,7 +191,7 @@ for (objects[0..count]) |item| item.* = .{ ... }; // initialize before a safepoi
 heap.maybeCollect();                   // call at safepoints; collects past a threshold
 heap.collect();                        // or force a full stop-the-world cycle
 const compacted = heap.collectAndCompact(); // opt-in binding: collect + relocate
-const stats = heap.accounting();       // race-safe live/last-full byte snapshot
+const stats = heap.accounting();       // race-safe generation + heap telemetry
 ```
 
 `create` and `createBatch` return uninitialized payloads — initialize them
@@ -202,18 +204,21 @@ batch reports its successfully published prefix so the caller can commit that
 work before the next allocation performs recovery or reports OOM, preserving
 sequential failure ordering.
 
-`accounting()` snapshots live cell/byte totals, collection counts, and the
-post-sweep byte size of the last completed full collection. Parallel and
-concurrent-metadata heaps take the collector's allocation lock for the snapshot;
-nursery-only cycles deliberately leave `last_full_collection_bytes` unchanged.
+`accounting()` snapshots live/young/promoted totals, collection counts, the
+configured tenuring age, the latest minor survivor/reclamation/promotion bytes,
+and the post-sweep byte size of the last full collection. Old-container and
+conservative-target cards persist while survivors remain young, so an unchanged
+old-to-young edge stays sound across repeated minors. Full collection or nursery
+disable explicitly tenures the remaining young prefix.
 
 ## Status
 
 The collector supports stop-the-world, incremental, concurrent, parallel, and
-one-cycle nursery paths, plus opt-in stop-the-world relocation. The default
-remains non-moving. Unit and TSan gates cover cycles, weak/finalization
-semantics, allocation/publication races, relocation rollback, pinned/moved
-graphs, and exact accounting.
+configurable multi-age nursery paths, plus opt-in stop-the-world relocation. The
+default remains non-moving with one-cycle tenuring until an embedder selects a
+higher age. Unit and TSan gates cover cycles, weak/finalization semantics,
+allocation/publication races, relocation rollback, pinned/moved graphs, and
+exact accounting.
 
 ## License
 

@@ -187,6 +187,8 @@ pub fn Heap(comptime Binding: type) type {
             void;
         pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
         pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
+        pub const default_tenuring_age: u8 = 1;
+        const tenured_age: u8 = std.math.maxInt(u8);
         const min_retained_scratch_entries: usize = 4096;
         const publication_shard_count = if (has_owned_cell_iterator) 64 else 0;
 
@@ -201,6 +203,7 @@ pub fn Heap(comptime Binding: type) type {
             kind: Kind,
             marked: bool,
             young: bool,
+            age: u8,
             remembered_owner: bool,
             remembered_target: bool,
         };
@@ -323,8 +326,11 @@ pub fn Heap(comptime Binding: type) type {
         young_bytes: usize = 0,
         last_minor_young_bytes: usize = 0,
         last_minor_reclaimed_bytes: usize = 0,
+        last_minor_survived_cells: usize = 0,
+        last_minor_survived_bytes: usize = 0,
         last_minor_promoted_bytes: usize = 0,
         nursery_threshold_bytes: usize = default_nursery_threshold_bytes,
+        tenuring_age: u8 = default_tenuring_age,
         nursery_enabled: bool = false,
         collection_kind: CollectionKind = .full,
         remembered_owners: std.ArrayListUnmanaged(*Header) = .empty,
@@ -561,12 +567,13 @@ pub fn Heap(comptime Binding: type) type {
             self.concurrent_marker_metadata = enabled;
         }
 
-        /// Enable the non-moving one-cycle nursery. New cells are young; a minor
-        /// collection reclaims unreachable young cells and immediately tenures
-        /// every survivor. Existing cells stay old, so enabling this after heap
-        /// initialization is safe. Disabling with a pending nursery tenures that
-        /// entire young prefix without collecting: later old allocations can
-        /// therefore never split the prefix before a re-enable.
+        /// Enable the non-moving nursery. New cells start at age zero; a minor
+        /// collection reclaims unreachable young cells, advances live survivors,
+        /// and tenures cells that reach `tenuring_age`. Existing cells stay old,
+        /// so enabling this after heap initialization is safe. Disabling with a
+        /// pending nursery tenures that entire young prefix without collecting:
+        /// later old allocations can therefore never split the prefix before a
+        /// re-enable.
         pub fn setNurseryEnabled(self: *Self, enabled: bool) void {
             std.debug.assert(!self.marking.load(.acquire));
             if (self.parallel) self.lockAlloc();
@@ -575,7 +582,17 @@ pub fn Heap(comptime Binding: type) type {
             defer if (reopen_shards) self.reopenShardedPublication();
             if (!enabled and self.nursery_enabled and self.young_cells != 0)
                 self.tenureYoungPrefix();
+            if (!enabled) self.clearRemembered();
             self.nursery_enabled = enabled;
+        }
+
+        /// Select how many successful minor collections a young cell must
+        /// survive before promotion. One preserves the original single-cycle
+        /// nursery policy; larger values retain a measured multi-age nursery.
+        pub fn setNurseryTenuringAge(self: *Self, age: u8) void {
+            std.debug.assert(age > 0 and age < tenured_age);
+            std.debug.assert(!self.marking.load(.acquire));
+            self.tenuring_age = age;
         }
 
         /// Race-safe accounting snapshot for embedders that expose heap usage
@@ -590,6 +607,16 @@ pub fn Heap(comptime Binding: type) type {
             collections: usize,
             full_collections: usize,
             minor_collections: usize,
+            young_cells: usize,
+            young_bytes: usize,
+            promoted_cells: usize,
+            promoted_bytes: usize,
+            tenuring_age: u8,
+            last_minor_young_bytes: usize,
+            last_minor_reclaimed_bytes: usize,
+            last_minor_survived_cells: usize,
+            last_minor_survived_bytes: usize,
+            last_minor_promoted_bytes: usize,
         };
 
         pub const CompactionStatus = enum {
@@ -617,6 +644,16 @@ pub fn Heap(comptime Binding: type) type {
                 .collections = self.collections,
                 .full_collections = self.full_collections,
                 .minor_collections = self.minor_collections,
+                .young_cells = self.young_cells,
+                .young_bytes = self.young_bytes,
+                .promoted_cells = self.promoted_cells,
+                .promoted_bytes = self.promoted_bytes,
+                .tenuring_age = self.tenuring_age,
+                .last_minor_young_bytes = self.last_minor_young_bytes,
+                .last_minor_reclaimed_bytes = self.last_minor_reclaimed_bytes,
+                .last_minor_survived_cells = self.last_minor_survived_cells,
+                .last_minor_survived_bytes = self.last_minor_survived_bytes,
+                .last_minor_promoted_bytes = self.last_minor_promoted_bytes,
             };
         }
 
@@ -631,6 +668,7 @@ pub fn Heap(comptime Binding: type) type {
                     break;
                 }
                 @atomicStore(bool, &h.young, false, .release);
+                h.age = tenured_age;
                 promoted_cells += 1;
                 promoted_bytes += header_stride + h.size;
             }
@@ -648,10 +686,10 @@ pub fn Heap(comptime Binding: type) type {
             return bytes * 2;
         }
 
-        fn nextNurseryThreshold(self: *Self, young_bytes: usize, promoted_bytes: usize) usize {
-            const promoted_target = @max(min_nursery_threshold_bytes, doubledBytes(promoted_bytes));
+        fn nextNurseryThreshold(self: *Self, young_bytes: usize, survivor_bytes: usize) usize {
+            const survivor_target = @max(min_nursery_threshold_bytes, doubledBytes(survivor_bytes));
             const decay_floor = @max(min_nursery_threshold_bytes, self.nursery_threshold_bytes / 2);
-            const adaptive = @max(promoted_target, decay_floor);
+            const adaptive = @max(survivor_target, decay_floor);
             // Decay remains gradual, but growth should not jump past the young
             // batch that was just measured. Otherwise high-survival bursts can
             // skip the next quiescent minor and carry a whole dead batch until a
@@ -985,6 +1023,7 @@ pub fn Heap(comptime Binding: type) type {
             h.kind = kind;
             @atomicStore(bool, &h.marked, born_grey, .release);
             @atomicStore(bool, &h.young, self.nursery_enabled, .release);
+            h.age = if (self.nursery_enabled) 0 else tenured_age;
             @atomicStore(bool, &h.remembered_owner, false, .release);
             @atomicStore(bool, &h.remembered_target, false, .release);
             // An owned backing may reserve a slot before this private header is
@@ -1114,6 +1153,7 @@ pub fn Heap(comptime Binding: type) type {
                         h.kind = kind;
                         @atomicStore(bool, &h.marked, false, .release);
                         @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                        h.age = if (nursery_snapshot) 0 else tenured_age;
                         @atomicStore(bool, &h.remembered_owner, false, .release);
                         @atomicStore(bool, &h.remembered_target, false, .release);
                     }
@@ -1134,6 +1174,7 @@ pub fn Heap(comptime Binding: type) type {
                     h.kind = kind;
                     @atomicStore(bool, &h.marked, false, .release);
                     @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                    h.age = if (nursery_snapshot) 0 else tenured_age;
                     @atomicStore(bool, &h.remembered_owner, false, .release);
                     @atomicStore(bool, &h.remembered_target, false, .release);
                     if (!owned_enumeration) {
@@ -1581,13 +1622,13 @@ pub fn Heap(comptime Binding: type) type {
 
         /// Run a stop-the-world nursery cycle. Old roots are not recursively
         /// rescanned; dirty old containers and conservative child-only barrier
-        /// targets supply the old-to-young frontier. Every live young cell is
-        /// tenured, so the nursery is empty when this returns.
+        /// targets supply the old-to-young frontier. Live young cells advance
+        /// one age and are tenured only when they reach `tenuring_age`.
         pub fn collectYoung(self: *Self) void {
             std.debug.assert(!self.marking.load(.acquire));
             std.debug.assert(!self.concurrent.load(.acquire));
             if (!self.nursery_enabled) return;
-            if (self.young_cells + self.publicationTotals().young_cells == 0) return;
+            if (self.young_bytes + self.publicationTotals().young_bytes == 0) return;
             if (self.nursery_force_full.load(.acquire)) {
                 self.collect();
                 return;
@@ -1657,6 +1698,7 @@ pub fn Heap(comptime Binding: type) type {
             for (self.remembered_targets.items) |h| v.mark(payloadOf(h));
             self.unlockRemember();
             while (self.mark_stack.pop()) |h| Binding.trace(payloadOf(h), h.kind, &v);
+            self.retainRememberedForMinorSweep();
             self.marking.store(false, .release);
             self.sweepPhase(&v);
             self.collection_kind = .full;
@@ -2062,6 +2104,10 @@ pub fn Heap(comptime Binding: type) type {
             var cycle_reclaimed_young_bytes: usize = 0;
             var cycle_reclaimed_cells: usize = 0;
             var cycle_reclaimed_bytes: usize = 0;
+            var cycle_survived_cells: usize = 0;
+            var cycle_survived_bytes: usize = 0;
+            var cycle_retained_young_cells: usize = 0;
+            var cycle_retained_young_bytes: usize = 0;
             var cycle_promoted_cells: usize = 0;
             var cycle_promoted_bytes: usize = 0;
             const release_batch_capacity = 64;
@@ -2082,9 +2128,19 @@ pub fn Heap(comptime Binding: type) type {
                 if (minor and young) cycle_young_bytes += total;
                 if (@atomicLoad(bool, &h.marked, .monotonic)) {
                     if (young) {
-                        @atomicStore(bool, &h.young, false, .release);
-                        cycle_promoted_cells += 1;
-                        cycle_promoted_bytes += total;
+                        cycle_survived_cells += 1;
+                        cycle_survived_bytes += total;
+                        const next_age = h.age + 1;
+                        if (!minor or next_age >= self.tenuring_age) {
+                            @atomicStore(bool, &h.young, false, .release);
+                            h.age = tenured_age;
+                            cycle_promoted_cells += 1;
+                            cycle_promoted_bytes += total;
+                        } else {
+                            h.age = next_age;
+                            cycle_retained_young_cells += 1;
+                            cycle_retained_young_bytes += total;
+                        }
                     }
                     prev = h;
                 } else {
@@ -2135,11 +2191,11 @@ pub fn Heap(comptime Binding: type) type {
             std.debug.assert(self.bytes_live >= cycle_reclaimed_bytes);
             self.live_cells -= cycle_reclaimed_cells;
             self.bytes_live -= cycle_reclaimed_bytes;
-            // Every collection kind traverses the complete young prefix (a
-            // minor stops exactly at the old boundary; a full continues past
-            // it), and every marked young cell is tenured during that walk.
-            self.young_cells = 0;
-            self.young_bytes = 0;
+            // Every collection kind traverses the complete young prefix. A
+            // minor retains sub-threshold survivors in that prefix; a full
+            // explicitly tenures every survivor and resets the frontier.
+            self.young_cells = if (minor) cycle_retained_young_cells else 0;
+            self.young_bytes = if (minor) cycle_retained_young_bytes else 0;
 
             self.collections += 1;
             self.promoted_cells += cycle_promoted_cells;
@@ -2148,14 +2204,16 @@ pub fn Heap(comptime Binding: type) type {
                 self.minor_collections += 1;
                 self.last_minor_young_bytes = cycle_young_bytes;
                 self.last_minor_reclaimed_bytes = cycle_reclaimed_young_bytes;
+                self.last_minor_survived_cells = cycle_survived_cells;
+                self.last_minor_survived_bytes = cycle_survived_bytes;
                 self.last_minor_promoted_bytes = cycle_promoted_bytes;
-                self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_young_bytes, cycle_promoted_bytes);
+                self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_young_bytes, cycle_survived_bytes);
             } else {
                 self.full_collections += 1;
                 self.last_full_collection_bytes = self.bytes_live;
                 self.threshold_bytes = @max(64 * 1024, self.bytes_live * 2);
             }
-            self.clearRemembered();
+            if (!minor) self.clearRemembered();
             self.nursery_force_full.store(false, .release);
             self.trimCollectorScratch();
         }
@@ -2173,6 +2231,29 @@ pub fn Heap(comptime Binding: type) type {
             self.remembered_owners.clearRetainingCapacity();
             self.remembered_targets.clearRetainingCapacity();
             self.unlockRemember();
+        }
+
+        /// Keep old-container cards across repeated minor collections. Without
+        /// this, a multi-age child reachable only through an unchanged old edge
+        /// would disappear on its second cycle. Conservative target-only cards
+        /// retain only targets proven live in this cycle, so sweep never leaves
+        /// a dangling header in the card list.
+        fn retainRememberedForMinorSweep(self: *Self) void {
+            self.lockRemember();
+            defer self.unlockRemember();
+            var retained: usize = 0;
+            for (self.remembered_targets.items) |h| {
+                const live_young = h.magic == header_magic and
+                    @atomicLoad(bool, &h.young, .monotonic) and
+                    @atomicLoad(bool, &h.marked, .monotonic);
+                if (live_young) {
+                    self.remembered_targets.items[retained] = h;
+                    retained += 1;
+                } else if (h.magic == header_magic) {
+                    @atomicStore(bool, &h.remembered_target, false, .release);
+                }
+            }
+            self.remembered_targets.items.len = retained;
         }
 
         fn retainedScratchEntryLimit(self: *Self) usize {
@@ -3084,6 +3165,122 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
     heap.threshold_bytes = 1;
     try std.testing.expect(heap.shouldCollectOld());
+}
+
+test "multi-age nursery retains survivors and promotes at the configured age" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    const H = Heap(TestRT);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryTenuringAge(3);
+    heap.setNurseryEnabled(true);
+
+    const survivor = try heap.create(TestRT.Node, .node);
+    survivor.* = .{ .id = 1 };
+    const later_garbage = try heap.create(TestRT.Node, .node);
+    later_garbage.* = .{ .id = 2 };
+    try rt.roots.append(a, survivor);
+    try rt.roots.append(a, later_garbage);
+
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 2), heap.young_cells);
+    try std.testing.expectEqual(@as(u8, 1), H.headerOf(survivor).age);
+    try std.testing.expectEqual(@as(usize, 2), heap.last_minor_survived_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.last_minor_promoted_bytes);
+
+    _ = rt.roots.pop();
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 1), heap.young_cells);
+    try std.testing.expectEqual(@as(u8, 2), H.headerOf(survivor).age);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+
+    heap.collectYoung();
+    const stats = heap.accounting();
+    try std.testing.expectEqual(@as(usize, 0), stats.young_cells);
+    try std.testing.expectEqual(@as(usize, 1), stats.promoted_cells);
+    try std.testing.expectEqual(@as(u8, 3), stats.tenuring_age);
+    try std.testing.expectEqual(@as(usize, 1), stats.last_minor_survived_cells);
+    try std.testing.expect(stats.last_minor_promoted_bytes > 0);
+    try std.testing.expectEqual(H.tenured_age, H.headerOf(survivor).age);
+}
+
+test "multi-age owner and weak cards persist across minor collections" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryTenuringAge(3);
+    heap.setNurseryEnabled(true);
+
+    const owner = try heap.create(TestRT.Node, .node);
+    owner.* = .{ .id = 1 };
+    try rt.roots.append(a, owner);
+    heap.collectYoung();
+    heap.collectYoung();
+    heap.collectYoung();
+
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    owner.strong = child;
+    heap.writeBarrierFromManaged(owner, child);
+    heap.collectYoung();
+    heap.collectYoung();
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+
+    const weak_target = try heap.create(TestRT.Node, .node);
+    weak_target.* = .{ .id = 3 };
+    owner.weak = weak_target;
+    try rt.roots.append(a, weak_target);
+    heap.writeBarrierWeak(owner);
+    heap.collectYoung();
+    _ = rt.roots.pop();
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(?*anyopaque, null), owner.weak);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
+
+    owner.strong = null;
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+}
+
+test "full collection and nursery disable tenure multi-age survivors" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    const H = Heap(TestRT);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryTenuringAge(4);
+    heap.setNurseryEnabled(true);
+
+    const full_survivor = try heap.create(TestRT.Node, .node);
+    full_survivor.* = .{ .id = 1 };
+    try rt.roots.append(a, full_survivor);
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 1), heap.young_cells);
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(H.tenured_age, H.headerOf(full_survivor).age);
+
+    const disabled_survivor = try heap.create(TestRT.Node, .node);
+    disabled_survivor.* = .{ .id = 2 };
+    try rt.roots.append(a, disabled_survivor);
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 1), heap.young_cells);
+    heap.setNurseryEnabled(false);
+    try std.testing.expectEqual(@as(usize, 0), heap.young_cells);
+    try std.testing.expectEqual(H.tenured_age, H.headerOf(disabled_survivor).age);
 }
 
 test "nursery disable tenures the pending prefix before old allocations" {
