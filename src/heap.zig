@@ -54,9 +54,10 @@ pub const InteriorOwnership = union(enum) {
     allocation: *anyopaque,
 };
 
-/// Address-independent identity for one cell within a relocation plan. The
-/// value is collector-private and exists only to correlate old/new addresses
-/// while the world is stopped; embedders must not expose it as language data.
+/// Process-unique, address-independent identity for one collector cell. IDs are
+/// non-zero, never recycled, and remain attached to a cell when compaction
+/// relocates its storage. Embedders may use them for diagnostics such as heap
+/// snapshots, but must not expose them as mutable language state.
 pub const StableCellId = enum(u64) {
     _,
 
@@ -65,6 +66,21 @@ pub const StableCellId = enum(u64) {
         return @enumFromInt(raw);
     }
 };
+
+var next_stable_cell_id: std.atomic.Value(u64) = .init(1);
+
+fn allocateStableCellId() StableCellId {
+    var current = next_stable_cell_id.load(.monotonic);
+    while (true) {
+        if (current == 0 or current == std.math.maxInt(u64))
+            @panic("zig-gc stable cell identity exhausted");
+        if (next_stable_cell_id.cmpxchgWeak(current, current + 1, .monotonic, .monotonic)) |observed| {
+            current = observed;
+            continue;
+        }
+        return .init(current);
+    }
+}
 
 pub const RelocationState = enum {
     reserved,
@@ -164,6 +180,11 @@ pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
         pub const Kind = Binding.Kind;
+        pub const CellMetadata = struct {
+            id: StableCellId,
+            kind: Kind,
+            size: usize,
+        };
         pub const RelocationRecordType = RelocationRecord(Kind);
         pub const RelocationVisitorType = RelocationVisitor(Kind);
         const has_owned_cell_iterator = @hasDecl(Binding, "ownedCellIterator");
@@ -198,6 +219,7 @@ pub fn Heap(comptime Binding: type) type {
         const header_magic: u64 = 0x7a67_6763_5f68_6561;
         pub const Header = struct {
             magic: u64,
+            stable_id: StableCellId,
             next: ?*Header,
             size: usize,
             kind: Kind,
@@ -917,6 +939,16 @@ pub fn Heap(comptime Binding: type) type {
             return self.headerForPayloadSlowLocked(payload);
         }
 
+        /// Return immutable diagnostics metadata for a live cell. The embedder
+        /// must call this at a heap-quiescent boundary, so collection cannot
+        /// reclaim the returned cell between lookup and the metadata reads.
+        /// Null and unmanaged/stale payloads return null.
+        pub fn cellMetadata(self: *Self, payload: ?*anyopaque) ?CellMetadata {
+            const ptr = payload orelse return null;
+            const h = self.headerForPayload(ptr) orelse return null;
+            return .{ .id = h.stable_id, .kind = h.kind, .size = h.size };
+        }
+
         fn indexPayloadLocked(self: *Self, h: *Header) void {
             if (self.bindingUsesOwnedCellStorage(header_stride + h.size)) return;
             self.payload_index.put(self.backing, payloadKey(payloadOf(h)), h) catch {};
@@ -1031,6 +1063,7 @@ pub fn Heap(comptime Binding: type) type {
             // `magic`/`next`/`size`/`kind` are only read at that finish (or by
             // sweep under `alloc_lock`), so they need no atomic.
             h.magic = header_magic;
+            h.stable_id = allocateStableCellId();
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             h.next = if (owned_enumeration) null else self.all;
             h.size = @sizeOf(T);
@@ -1162,6 +1195,7 @@ pub fn Heap(comptime Binding: type) type {
                     for (out) |payload| {
                         const h = headerOf(payload);
                         h.magic = header_magic;
+                        h.stable_id = allocateStableCellId();
                         h.next = null;
                         h.size = @sizeOf(T);
                         h.kind = kind;
@@ -1183,6 +1217,7 @@ pub fn Heap(comptime Binding: type) type {
                 for (out) |payload| {
                     const h = headerOf(payload);
                     h.magic = header_magic;
+                    h.stable_id = allocateStableCellId();
                     h.next = if (owned_enumeration) null else private_head;
                     h.size = @sizeOf(T);
                     h.kind = kind;
@@ -1556,7 +1591,7 @@ pub fn Heap(comptime Binding: type) type {
                 const new_payload = payloadOf(@ptrCast(@alignCast(new_header)));
                 const record_index = records.items.len;
                 records.appendAssumeCapacity(.{
-                    .id = .init(@as(u64, @intCast(record_index)) + 1),
+                    .id = old_header.stable_id,
                     .kind = old_header.kind,
                     .size = old_header.size,
                     .old_payload = old_payload,
@@ -2841,6 +2876,56 @@ const FreeCountingAllocator = struct {
     }
 };
 
+test "stable cell metadata is process-unique, batched, and never recycled" {
+    const a = std.testing.allocator;
+    var first_rt = TestRT{};
+    defer first_rt.roots.deinit(a);
+    defer first_rt.finalized.deinit(a);
+    var second_rt = TestRT{};
+    defer second_rt.roots.deinit(a);
+    defer second_rt.finalized.deinit(a);
+
+    var first = Heap(TestRT).init(a, &first_rt);
+    defer first.deinit();
+    var second = Heap(TestRT).init(a, &second_rt);
+    defer second.deinit();
+
+    const N = TestRT.Node;
+    const rooted = try first.create(N, .node);
+    rooted.* = .{ .id = 1 };
+    try first_rt.roots.append(a, rooted);
+    const other_heap = try second.create(N, .node);
+    other_heap.* = .{ .id = 2 };
+
+    var batch: [4]*N = undefined;
+    try std.testing.expectEqual(batch.len, try first.createBatch(N, .node, &batch));
+    for (batch, 0..) |node, i| node.* = .{ .id = @intCast(i + 10) };
+
+    var ids: [6]StableCellId = undefined;
+    ids[0] = first.cellMetadata(rooted).?.id;
+    ids[1] = second.cellMetadata(other_heap).?.id;
+    for (batch, 0..) |node, i| ids[i + 2] = first.cellMetadata(node).?.id;
+    for (ids, 0..) |id, i| {
+        try std.testing.expect(@intFromEnum(id) != 0);
+        for (ids[0..i]) |prior| try std.testing.expect(id != prior);
+    }
+    try std.testing.expectEqual(@sizeOf(N), first.cellMetadata(rooted).?.size);
+    try std.testing.expectEqual(TestRT.Kind.node, first.cellMetadata(rooted).?.kind);
+
+    var unmanaged: N = .{ .id = 99 };
+    try std.testing.expectEqual(@as(?Heap(TestRT).CellMetadata, null), first.cellMetadata(&unmanaged));
+    try std.testing.expectEqual(@as(?Heap(TestRT).CellMetadata, null), first.cellMetadata(null));
+
+    const doomed = try first.create(N, .node);
+    doomed.* = .{ .id = 20 };
+    const doomed_id = first.cellMetadata(doomed).?.id;
+    first.collect();
+    try std.testing.expectEqual(@as(?Heap(TestRT).CellMetadata, null), first.cellMetadata(doomed));
+    const replacement = try first.create(N, .node);
+    replacement.* = .{ .id = 21 };
+    try std.testing.expect(first.cellMetadata(replacement).?.id != doomed_id);
+}
+
 test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -2909,6 +2994,11 @@ test "stop-the-world compaction rewrites cycles weak roots and pinned edges" {
     try rt.roots.append(a, pinned);
     try rt.roots.append(a, weak_survivor);
 
+    const old_a_id = heap.cellMetadata(old_a).?.id;
+    const old_b_id = heap.cellMetadata(old_b).?.id;
+    const weak_survivor_id = heap.cellMetadata(weak_survivor).?.id;
+    const pinned_id = heap.cellMetadata(pinned).?.id;
+
     const before = heap.accounting();
     const result = heap.collectAndCompact();
     try std.testing.expectEqual(Heap(TestRT).CompactionStatus.compacted, result.status);
@@ -2927,6 +3017,10 @@ test "stop-the-world compaction rewrites cycles weak roots and pinned edges" {
     try std.testing.expectEqual(@as(?*anyopaque, null), new_b.weak);
     try std.testing.expectEqual(pinned, rt.roots.items[1]);
     try std.testing.expectEqual(new_b, pinned.strong.?);
+    try std.testing.expectEqual(old_a_id, heap.cellMetadata(new_a).?.id);
+    try std.testing.expectEqual(old_b_id, heap.cellMetadata(new_b).?.id);
+    try std.testing.expectEqual(weak_survivor_id, heap.cellMetadata(rt.roots.items[2]).?.id);
+    try std.testing.expectEqual(pinned_id, heap.cellMetadata(pinned).?.id);
     try std.testing.expectEqual(@as(usize, 1), rt.relocation_root_verifications);
     try std.testing.expectEqual(@as(usize, 4), rt.relocation_cell_verifications);
 
