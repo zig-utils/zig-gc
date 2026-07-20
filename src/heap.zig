@@ -29,6 +29,8 @@
 //!   fn canRelocate(ctx: *B, cell: *anyopaque, kind: Kind) bool;
 //!   fn relocateRoots(ctx: *B, v: anytype) void;
 //!   fn relocateCell(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
+//!   fn verifyRelocationRoots(ctx: *B, v: anytype) void;
+//!   fn verifyRelocationCell(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
 //!   fn reserveRelocationCell(ctx: *B, total: usize) ?*anyopaque;
 //!   fn releaseRelocationReservation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!   fn commitRelocationCell(ctx: *B, old: *anyopaque, new: *anyopaque, total: usize) void;
@@ -168,12 +170,16 @@ pub fn Heap(comptime Binding: type) type {
         const supports_relocation = @hasDecl(Binding, "canRelocate") and
             @hasDecl(Binding, "relocateRoots") and
             @hasDecl(Binding, "relocateCell");
+        const relocation_verify_hooks = @as(u2, @intFromBool(@hasDecl(Binding, "verifyRelocationRoots"))) +
+            @as(u2, @intFromBool(@hasDecl(Binding, "verifyRelocationCell")));
         const custom_relocation_storage_hooks = @as(u2, @intFromBool(@hasDecl(Binding, "reserveRelocationCell"))) +
             @as(u2, @intFromBool(@hasDecl(Binding, "releaseRelocationReservation"))) +
             @as(u2, @intFromBool(@hasDecl(Binding, "commitRelocationCell")));
         comptime {
             if (custom_relocation_storage_hooks != 0 and custom_relocation_storage_hooks != 3)
                 @compileError("relocation storage hooks must be supplied as reserve/release/commit trio");
+            if (relocation_verify_hooks != 0 and relocation_verify_hooks != 2)
+                @compileError("relocation verification hooks must be supplied as roots/cell pair");
         }
         const OwnedCellIterator = if (has_owned_cell_iterator)
             @typeInfo(@TypeOf(Binding.ownedCellIterator)).@"fn".return_type.?
@@ -1553,6 +1559,16 @@ pub fn Heap(comptime Binding: type) type {
                 old_header.magic = 0;
                 self.commitRelocationCell(old_header, new_header, total);
             }
+            if (comptime relocation_verify_hooks == 2) {
+                // Forwarding records are still live, while the binding's
+                // publication/index metadata already names only committed
+                // destinations. Verification must be allocation-free and may
+                // trap on any stale old payload retained by the embedder.
+                Binding.verifyRelocationRoots(self.ctx, &visitor);
+                var verify_cells = self.cellIterator();
+                while (verify_cells.next()) |header|
+                    Binding.verifyRelocationCell(self.ctx, payloadOf(header), header.kind, &visitor);
+            }
             self.weak_slots.clearRetainingCapacity();
             self.weak_atomic_slots.clearRetainingCapacity();
             self.addr_index_built = false;
@@ -2293,6 +2309,8 @@ const TestRT = struct {
     relocation_reserve_calls: usize = 0,
     relocation_rollbacks: usize = 0,
     relocation_commits: usize = 0,
+    relocation_root_verifications: usize = 0,
+    relocation_cell_verifications: usize = 0,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
@@ -2349,6 +2367,24 @@ const TestRT = struct {
                 const n: *Node = @ptrCast(@alignCast(cell));
                 if (n.strong) |strong| n.strong = @ptrCast(@alignCast(v.resolve(strong)));
                 if (n.weak) |weak| n.weak = v.resolve(weak);
+            },
+        }
+    }
+
+    pub fn verifyRelocationRoots(self: *TestRT, v: anytype) void {
+        self.relocation_root_verifications += 1;
+        for (self.roots.items) |root|
+            std.debug.assert(!v.moved(root));
+    }
+
+    pub fn verifyRelocationCell(self: *TestRT, cell: *anyopaque, kind: Kind, v: anytype) void {
+        self.relocation_cell_verifications += 1;
+        std.debug.assert(!v.moved(cell));
+        switch (kind) {
+            .node => {
+                const node: *Node = @ptrCast(@alignCast(cell));
+                if (node.strong) |strong| std.debug.assert(!v.moved(strong));
+                if (node.weak) |weak| std.debug.assert(!v.moved(weak));
             },
         }
     }
@@ -2792,6 +2828,8 @@ test "stop-the-world compaction rewrites cycles weak roots and pinned edges" {
     try std.testing.expectEqual(@as(?*anyopaque, null), new_b.weak);
     try std.testing.expectEqual(pinned, rt.roots.items[1]);
     try std.testing.expectEqual(new_b, pinned.strong.?);
+    try std.testing.expectEqual(@as(usize, 1), rt.relocation_root_verifications);
+    try std.testing.expectEqual(@as(usize, 4), rt.relocation_cell_verifications);
 
     const after = heap.accounting();
     try std.testing.expectEqual(before.live_cells - 1, after.live_cells);

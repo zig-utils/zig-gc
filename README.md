@@ -141,6 +141,19 @@ the original address for a pinned cell. Pinned cells are still passed to
 `relocateCell` because they may point at moved children. The collector exposes
 `StableCellId`, `RelocationRecord`, and `RelocationVisitor` for plan auditing.
 
+Bindings may also opt into a paired post-commit audit while forwarding records
+are still live:
+
+```zig
+fn verifyRelocationRoots(ctx: *B, v: anytype) void;
+fn verifyRelocationCell(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
+```
+
+The collector calls these only after every destination and index/publication
+update commits. They must be allocation-free and infallible; an embedder may
+use `v.moved(pointer)` to trap if any audited root or live edge still contains
+an old payload address.
+
 The default destination path uses the heap backing allocator. Owned slab
 bindings may instead make unpublished reservations and atomically update their
 publication metadata with:
