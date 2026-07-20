@@ -1,7 +1,9 @@
 # zig-gc
 
-A precise, non-moving, tri-color **mark-sweep garbage collector** in pure Zig,
-generic over an embedder *binding*. No dependencies.
+A precise, tri-color **mark-sweep garbage collector** in pure Zig, generic over
+an embedder *binding*. The default is non-moving; an opt-in stop-the-world
+relocation pass is available to bindings with complete rewrite coverage. No
+dependencies.
 
 Built to unblock Phase 7 (GIL removal / true parallelism) of the
 [zig-js](../zig-js) JavaScript engine, but the core is runtime-agnostic — it
@@ -9,15 +11,18 @@ follows the [MMTk](https://www.mmtk.io/) model of a reusable collector mechanism
 driven by a small, language-specific binding. Full design rationale:
 `zig-js/docs/threads/P7-gc-design.md`.
 
-## Why precise + non-moving
+## Why precise + a non-moving default
 
 - **Precise** (the collector traces only real references) — a conservative GC
   would falsely retain the `f64`s and NaN-boxed words that fill a JS heap, and
   precise reachability is *required* to clear weak references and fire
   finalizers correctly.
-- **Non-moving** — no compaction, no pointer rewriting, no read barriers. Simple
-  to get correct, and it matches the reference design for concurrent JS GC
-  (WebKit's Riptide is non-moving).
+- **Non-moving by default** — bindings pay no relocation metadata, pointer
+  rewriting, or read-barrier cost unless they explicitly implement the complete
+  compaction contract. This remains the concurrency-friendly baseline.
+- **Optional failure-atomic compaction** — a full stop-the-world collection can
+  reserve every destination first, rewrite a complete live graph, and then
+  commit address changes without finalizing moved cells.
 - **Mark-sweep, tri-color** — incrementalizable and concurrentizable behind a
   write barrier, which is the path to lock-free parallelism.
 
@@ -119,6 +124,39 @@ their own shard, while a collector closes the gate, drains active publishers,
 and folds all deltas once before marking. Active marking retains the serialized
 born-grey path.
 
+### Optional relocation
+
+A binding opts into `collectAndCompact()` only by defining all three graph
+hooks:
+
+```zig
+fn canRelocate(ctx: *B, cell: *anyopaque, kind: Kind) bool;
+fn relocateRoots(ctx: *B, v: anytype) void;
+fn relocateCell(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
+```
+
+`canRelocate` may pin any cell. Both rewrite hooks must replace every pointer
+with `v.resolve(old)`; the resolver returns the destination for a moved cell and
+the original address for a pinned cell. Pinned cells are still passed to
+`relocateCell` because they may point at moved children. The collector exposes
+`StableCellId`, `RelocationRecord`, and `RelocationVisitor` for plan auditing.
+
+The default destination path uses the heap backing allocator. Owned slab
+bindings may instead make unpublished reservations and atomically update their
+publication metadata with:
+
+```zig
+fn reserveRelocationCell(ctx: *B, total: usize) ?*anyopaque;
+fn releaseRelocationReservation(ctx: *B, allocation: *anyopaque, total: usize) void;
+fn commitRelocationCell(ctx: *B, old: *anyopaque, new: *anyopaque, total: usize) void;
+```
+
+All scratch capacity and destinations are reserved before mutation. Any failure
+rolls back every reservation and returns `.out_of_memory` with the old graph,
+indexes, publication state, and accounting intact. Once copying begins, graph
+rewrite and commit hooks must be allocation-free and infallible. Relocation is
+stop-the-world only; concurrent/native safepoints remain an embedder concern.
+
 ## Usage
 
 ```zig
@@ -137,6 +175,7 @@ for (objects[0..count]) |item| item.* = .{ ... }; // initialize before a safepoi
 
 heap.maybeCollect();                   // call at safepoints; collects past a threshold
 heap.collect();                        // or force a full stop-the-world cycle
+const compacted = heap.collectAndCompact(); // opt-in binding: collect + relocate
 const stats = heap.accounting();       // race-safe live/last-full byte snapshot
 ```
 
@@ -157,12 +196,11 @@ nursery-only cycles deliberately leave `last_full_collection_bytes` unchanged.
 
 ## Status
 
-**M1 scaffold**: a working stop-the-world collector (no write barrier needed
-while the world is stopped) with cycles, garbage reclamation, weak edges, and
-finalizers — see `src/heap.zig` tests (`zig build test`). The same core
-incrementalizes (M2: insertion write barrier, lazy sweep) and concurrentizes
-(M3: per-object locks, drop the GIL) per the staged plan in the zig-js design
-note.
+The collector supports stop-the-world, incremental, concurrent, parallel, and
+one-cycle nursery paths, plus opt-in stop-the-world relocation. The default
+remains non-moving. Unit and TSan gates cover cycles, weak/finalization
+semantics, allocation/publication races, relocation rollback, pinned/moved
+graphs, and exact accounting.
 
 ## License
 

@@ -4,6 +4,10 @@
 
 pub const Heap = @import("heap.zig").Heap;
 pub const InteriorOwnership = @import("heap.zig").InteriorOwnership;
+pub const RelocationRecord = @import("heap.zig").RelocationRecord;
+pub const RelocationState = @import("heap.zig").RelocationState;
+pub const RelocationVisitor = @import("heap.zig").RelocationVisitor;
+pub const StableCellId = @import("heap.zig").StableCellId;
 
 test {
     _ = @import("heap.zig");

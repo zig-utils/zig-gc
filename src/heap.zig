@@ -26,6 +26,12 @@
 //!   fn publishCellAllocationBatch(ctx: *B, payloads: []*anyopaque, total: usize, payload_offset: usize) void;
 //!   fn unpublishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!   fn ownedCellIterator(ctx: *B) Iterator; // Iterator.next() ?*anyopaque
+//!   fn canRelocate(ctx: *B, cell: *anyopaque, kind: Kind) bool;
+//!   fn relocateRoots(ctx: *B, v: anytype) void;
+//!   fn relocateCell(ctx: *B, cell: *anyopaque, kind: Kind, v: anytype) void;
+//!   fn reserveRelocationCell(ctx: *B, total: usize) ?*anyopaque;
+//!   fn releaseRelocationReservation(ctx: *B, allocation: *anyopaque, total: usize) void;
+//!   fn commitRelocationCell(ctx: *B, old: *anyopaque, new: *anyopaque, total: usize) void;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -45,6 +51,63 @@ pub const InteriorOwnership = union(enum) {
     owned_empty,
     allocation: *anyopaque,
 };
+
+/// Address-independent identity for one cell within a relocation plan. The
+/// value is collector-private and exists only to correlate old/new addresses
+/// while the world is stopped; embedders must not expose it as language data.
+pub const StableCellId = enum(u64) {
+    _,
+
+    pub fn init(raw: u64) StableCellId {
+        std.debug.assert(raw != 0);
+        return @enumFromInt(raw);
+    }
+};
+
+pub const RelocationState = enum {
+    reserved,
+    copied,
+    rewritten,
+};
+
+pub fn RelocationRecord(comptime Kind: type) type {
+    return struct {
+        id: StableCellId,
+        kind: Kind,
+        size: usize,
+        old_payload: *anyopaque,
+        new_payload: *anyopaque,
+        state: RelocationState = .reserved,
+    };
+}
+
+/// Infallible old→new resolver handed to binding rewrite hooks after every
+/// destination has been reserved. Cells absent from the plan are pinned and
+/// retain their address. Dead weak targets have already been cleared before
+/// relocation begins, so every non-null weak target follows the same mapping.
+pub fn RelocationVisitor(comptime Kind: type) type {
+    return struct {
+        const Record = RelocationRecord(Kind);
+        records: []const Record,
+        index: *const std.AutoHashMapUnmanaged(usize, usize),
+
+        pub fn resolve(self: *const @This(), old_payload: *anyopaque) *anyopaque {
+            const record_index = self.index.get(@intFromPtr(old_payload)) orelse return old_payload;
+            const record = &self.records[record_index];
+            std.debug.assert(record.old_payload == old_payload);
+            return record.new_payload;
+        }
+
+        pub fn moved(self: *const @This(), old_payload: *anyopaque) bool {
+            return self.index.contains(@intFromPtr(old_payload));
+        }
+
+        pub fn stableId(self: *const @This(), old_payload: *anyopaque) ?StableCellId {
+            const record_index = self.index.get(@intFromPtr(old_payload)) orelse return null;
+            return self.records[record_index].id;
+        }
+    };
+}
 
 const use_pthread_weak_lock = switch (builtin.os.tag) {
     .linux,
@@ -99,7 +162,19 @@ pub fn Heap(comptime Binding: type) type {
     return struct {
         const Self = @This();
         pub const Kind = Binding.Kind;
+        pub const RelocationRecordType = RelocationRecord(Kind);
+        pub const RelocationVisitorType = RelocationVisitor(Kind);
         const has_owned_cell_iterator = @hasDecl(Binding, "ownedCellIterator");
+        const supports_relocation = @hasDecl(Binding, "canRelocate") and
+            @hasDecl(Binding, "relocateRoots") and
+            @hasDecl(Binding, "relocateCell");
+        const custom_relocation_storage_hooks = @as(u2, @intFromBool(@hasDecl(Binding, "reserveRelocationCell"))) +
+            @as(u2, @intFromBool(@hasDecl(Binding, "releaseRelocationReservation"))) +
+            @as(u2, @intFromBool(@hasDecl(Binding, "commitRelocationCell")));
+        comptime {
+            if (custom_relocation_storage_hooks != 0 and custom_relocation_storage_hooks != 3)
+                @compileError("relocation storage hooks must be supplied as reserve/release/commit trio");
+        }
         const OwnedCellIterator = if (has_owned_cell_iterator)
             @typeInfo(@TypeOf(Binding.ownedCellIterator)).@"fn".return_type.?
         else
@@ -511,6 +586,19 @@ pub fn Heap(comptime Binding: type) type {
             minor_collections: usize,
         };
 
+        pub const CompactionStatus = enum {
+            unsupported,
+            no_candidates,
+            out_of_memory,
+            compacted,
+        };
+
+        pub const CompactionResult = struct {
+            status: CompactionStatus,
+            moved_cells: usize = 0,
+            moved_bytes: usize = 0,
+        };
+
         pub fn accounting(self: *Self) Accounting {
             if (self.syncAllocMetadata()) self.lockAlloc();
             defer if (self.syncAllocMetadata()) self.unlockAlloc();
@@ -608,6 +696,33 @@ pub fn Heap(comptime Binding: type) type {
         inline fn bindingEnumeratesOwnedCells(self: *Self) bool {
             if (comptime !has_owned_cell_iterator) return false;
             return self.bindingAllCellsUseOwnedStorage();
+        }
+
+        fn reserveRelocationCell(self: *Self, total: usize) ?*anyopaque {
+            if (@hasDecl(Binding, "reserveRelocationCell"))
+                return self.ctx.reserveRelocationCell(total);
+            const slab = self.backing.alignedAlloc(u8, .@"16", total) catch return null;
+            return slab.ptr;
+        }
+
+        fn releaseRelocationReservation(self: *Self, allocation: *anyopaque, total: usize) void {
+            if (@hasDecl(Binding, "releaseRelocationReservation")) {
+                self.ctx.releaseRelocationReservation(allocation, total);
+                return;
+            }
+            const base: [*]align(16) u8 = @ptrCast(@alignCast(allocation));
+            self.backing.free(base[0..total]);
+        }
+
+        fn commitRelocationCell(self: *Self, old: *Header, new: *Header, total: usize) void {
+            if (@hasDecl(Binding, "commitRelocationCell")) {
+                self.ctx.commitRelocationCell(old, new, total);
+                return;
+            }
+            self.bindingUnpublishCellAllocation(old, total);
+            self.bindingPublishCellAllocation(new, total);
+            const base: [*]align(16) u8 = @ptrCast(@alignCast(old));
+            self.backing.free(base[0..total]);
         }
 
         inline fn cellIterator(self: *Self) CellIterator {
@@ -1332,6 +1447,122 @@ pub fn Heap(comptime Binding: type) type {
             self.finishMarking();
         }
 
+        /// Run a full collection and then compact every live cell accepted by
+        /// the binding. Destination reservation is failure-atomic: allocation
+        /// and the old→new index complete before the first old byte, root, edge,
+        /// publication bit, or heap index is changed. Rewrite/commit hooks are
+        /// therefore infallible and execute only with a complete plan.
+        pub fn collectAndCompact(self: *Self) CompactionResult {
+            if (comptime !supports_relocation) return .{ .status = .unsupported };
+            self.collect();
+            return self.compactLiveCells();
+        }
+
+        fn compactLiveCells(self: *Self) CompactionResult {
+            if (comptime !supports_relocation) return .{ .status = .unsupported };
+            std.debug.assert(!self.marking.load(.acquire));
+            std.debug.assert(!self.concurrent.load(.acquire));
+
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            const reopen_shards = self.closeAndFoldPublicationShards();
+            defer if (reopen_shards) self.reopenShardedPublication();
+
+            var records: std.ArrayListUnmanaged(RelocationRecordType) = .empty;
+            defer records.deinit(self.aux);
+            var index: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+            defer index.deinit(self.aux);
+            records.ensureTotalCapacity(self.aux, self.live_cells) catch
+                return .{ .status = .out_of_memory };
+            const index_capacity = std.math.cast(u32, self.live_cells) orelse
+                return .{ .status = .out_of_memory };
+            index.ensureTotalCapacity(self.aux, index_capacity) catch
+                return .{ .status = .out_of_memory };
+
+            var moved_bytes: usize = 0;
+            var cells = self.cellIterator();
+            while (cells.next()) |old_header| {
+                const old_payload = payloadOf(old_header);
+                if (!Binding.canRelocate(self.ctx, old_payload, old_header.kind)) continue;
+                const total = header_stride + old_header.size;
+                const new_header = self.reserveRelocationCell(total) orelse {
+                    for (records.items) |record|
+                        self.releaseRelocationReservation(headerOf(record.new_payload), header_stride + record.size);
+                    return .{ .status = .out_of_memory };
+                };
+                std.debug.assert(new_header != @as(*anyopaque, @ptrCast(old_header)));
+                std.debug.assert(@intFromPtr(new_header) % 16 == 0);
+                const new_payload = payloadOf(@ptrCast(@alignCast(new_header)));
+                const record_index = records.items.len;
+                records.appendAssumeCapacity(.{
+                    .id = .init(@as(u64, @intCast(record_index)) + 1),
+                    .kind = old_header.kind,
+                    .size = old_header.size,
+                    .old_payload = old_payload,
+                    .new_payload = new_payload,
+                });
+                index.putAssumeCapacity(@intFromPtr(old_payload), record_index);
+                moved_bytes += total;
+            }
+            if (records.items.len == 0) return .{ .status = .no_candidates };
+
+            for (records.items) |*record| {
+                const total = header_stride + record.size;
+                const old_bytes: [*]const u8 = @ptrCast(headerOf(record.old_payload));
+                const new_bytes: [*]u8 = @ptrCast(headerOf(record.new_payload));
+                @memcpy(new_bytes[0..total], old_bytes[0..total]);
+                record.state = .copied;
+            }
+
+            const visitor = RelocationVisitorType{ .records = records.items, .index = &index };
+            Binding.relocateRoots(self.ctx, &visitor);
+            // Pinned cells can still point at moved cells, so rewrite the
+            // complete live graph. Moved cells are visited at their copied
+            // destination; pinned cells remain at their original address.
+            var rewrite_cells = self.cellIterator();
+            while (rewrite_cells.next()) |old_header| {
+                const current_payload = visitor.resolve(payloadOf(old_header));
+                Binding.relocateCell(self.ctx, current_payload, old_header.kind, &visitor);
+            }
+            for (records.items) |*record| record.state = .rewritten;
+
+            // Repair the generic intrusive list before freeing any old header.
+            // Owned-storage bindings enumerate their own publication bitmaps and
+            // keep `all == null`, so this loop is empty for that fast path.
+            var old_cursor = self.all;
+            while (old_cursor) |old_header| {
+                const old_next = old_header.next;
+                const current_payload = visitor.resolve(payloadOf(old_header));
+                const current_header = headerOf(current_payload);
+                current_header.next = if (old_next) |next|
+                    headerOf(visitor.resolve(payloadOf(next)))
+                else
+                    null;
+                old_cursor = old_next;
+            }
+            if (self.all) |old_head| self.all = headerOf(visitor.resolve(payloadOf(old_head)));
+
+            for (records.items) |record| {
+                const old_header = headerOf(record.old_payload);
+                const new_header = headerOf(record.new_payload);
+                const total = header_stride + record.size;
+                self.unindexPayloadLocked(old_header);
+                self.indexPayloadLocked(new_header);
+                // The old liveness witness disappears only after roots, edges,
+                // and the generic list/index all point at the destination.
+                old_header.magic = 0;
+                self.commitRelocationCell(old_header, new_header, total);
+            }
+            self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
+            self.addr_index_built = false;
+            return .{
+                .status = .compacted,
+                .moved_cells = records.items.len,
+                .moved_bytes = moved_bytes,
+            };
+        }
+
         /// Run a stop-the-world nursery cycle. Old roots are not recursively
         /// rescanned; dirty old containers and conservative child-only barrier
         /// targets supply the old-to-young frontier. Every live young cell is
@@ -2011,6 +2242,33 @@ pub fn Heap(comptime Binding: type) type {
 // finalizers, asserting *exact* reclamation (the collector is precise).
 // ---------------------------------------------------------------------------
 
+test "relocation visitor resolves moved cells and preserves pinned cells" {
+    const Kind = enum { object, string };
+    const Record = RelocationRecord(Kind);
+    const Visitor = RelocationVisitor(Kind);
+    var old_object: u64 = 1;
+    var new_object: u64 = 2;
+    var pinned_string: u64 = 3;
+    const records = [_]Record{.{
+        .id = .init(17),
+        .kind = .object,
+        .size = @sizeOf(u64),
+        .old_payload = &old_object,
+        .new_payload = &new_object,
+    }};
+    var index: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+    defer index.deinit(std.testing.allocator);
+    try index.put(std.testing.allocator, @intFromPtr(&old_object), 0);
+    const visitor = Visitor{ .records = &records, .index = &index };
+
+    try std.testing.expectEqual(@as(*anyopaque, &new_object), visitor.resolve(&old_object));
+    try std.testing.expectEqual(@as(*anyopaque, &pinned_string), visitor.resolve(&pinned_string));
+    try std.testing.expect(visitor.moved(&old_object));
+    try std.testing.expect(!visitor.moved(&pinned_string));
+    try std.testing.expectEqual(@as(u64, 17), @intFromEnum(visitor.stableId(&old_object).?));
+    try std.testing.expectEqual(@as(?StableCellId, null), visitor.stableId(&pinned_string));
+}
+
 const TestRT = struct {
     pub const Kind = enum { node };
 
@@ -2031,6 +2289,10 @@ const TestRT = struct {
     after_sweep_under_alloc_lock: bool = false,
     publication_gate_probe: ?*std.atomic.Value(bool) = null,
     after_sweep_before_publication_reopened: bool = false,
+    relocation_reserve_limit: usize = std.math.maxInt(usize),
+    relocation_reserve_calls: usize = 0,
+    relocation_rollbacks: usize = 0,
+    relocation_commits: usize = 0,
 
     pub fn traceRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |n| v.mark(n);
@@ -2068,6 +2330,46 @@ const TestRT = struct {
                 v.markWeak(&n.weak);
             },
         }
+    }
+
+    pub fn canRelocate(_: *TestRT, cell: *anyopaque, kind: Kind) bool {
+        return switch (kind) {
+            .node => @as(*Node, @ptrCast(@alignCast(cell))).id != 99,
+        };
+    }
+
+    pub fn relocateRoots(self: *TestRT, v: anytype) void {
+        for (self.roots.items) |*root|
+            root.* = @ptrCast(@alignCast(v.resolve(root.*)));
+    }
+
+    pub fn relocateCell(_: *TestRT, cell: *anyopaque, kind: Kind, v: anytype) void {
+        switch (kind) {
+            .node => {
+                const n: *Node = @ptrCast(@alignCast(cell));
+                if (n.strong) |strong| n.strong = @ptrCast(@alignCast(v.resolve(strong)));
+                if (n.weak) |weak| n.weak = v.resolve(weak);
+            },
+        }
+    }
+
+    pub fn reserveRelocationCell(self: *TestRT, total: usize) ?*anyopaque {
+        if (self.relocation_reserve_calls == self.relocation_reserve_limit) return null;
+        self.relocation_reserve_calls += 1;
+        const slab = std.testing.allocator.alignedAlloc(u8, .@"16", total) catch return null;
+        return slab.ptr;
+    }
+
+    pub fn releaseRelocationReservation(self: *TestRT, allocation: *anyopaque, total: usize) void {
+        self.relocation_rollbacks += 1;
+        const base: [*]align(16) u8 = @ptrCast(@alignCast(allocation));
+        std.testing.allocator.free(base[0..total]);
+    }
+
+    pub fn commitRelocationCell(self: *TestRT, old: *anyopaque, _: *anyopaque, total: usize) void {
+        self.relocation_commits += 1;
+        const base: [*]align(16) u8 = @ptrCast(@alignCast(old));
+        std.testing.allocator.free(base[0..total]);
     }
 
     pub fn finalize(self: *TestRT, cell: *anyopaque, kind: Kind) void {
@@ -2441,6 +2743,118 @@ test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear"
     heap.collect();
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     try std.testing.expectEqual(@as(usize, 3), rt.finalized.items.len);
+}
+
+test "stop-the-world compaction rewrites cycles weak roots and pinned edges" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    const N = TestRT.Node;
+    const old_a = try heap.create(N, .node);
+    old_a.* = .{ .id = 1 };
+    const old_b = try heap.create(N, .node);
+    old_b.* = .{ .id = 2 };
+    const dead = try heap.create(N, .node);
+    dead.* = .{ .id = 3 };
+    const weak_survivor = try heap.create(N, .node);
+    weak_survivor.* = .{ .id = 4 };
+    const pinned = try heap.create(N, .node);
+    pinned.* = .{ .id = 99 };
+    old_a.strong = old_b;
+    old_a.weak = weak_survivor;
+    old_b.strong = old_a;
+    old_b.weak = dead;
+    pinned.strong = old_b;
+    try rt.roots.append(a, old_a);
+    try rt.roots.append(a, pinned);
+    try rt.roots.append(a, weak_survivor);
+
+    const before = heap.accounting();
+    const result = heap.collectAndCompact();
+    try std.testing.expectEqual(Heap(TestRT).CompactionStatus.compacted, result.status);
+    try std.testing.expectEqual(@as(usize, 3), result.moved_cells);
+    try std.testing.expect(result.moved_bytes != 0);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
+
+    const new_a = rt.roots.items[0];
+    const new_b = new_a.strong.?;
+    try std.testing.expect(new_a != old_a);
+    try std.testing.expect(new_b != old_b);
+    try std.testing.expectEqual(new_a, new_b.strong.?);
+    try std.testing.expectEqual(@as(*anyopaque, rt.roots.items[2]), new_a.weak.?);
+    try std.testing.expect(rt.roots.items[2] != weak_survivor);
+    try std.testing.expectEqual(@as(?*anyopaque, null), new_b.weak);
+    try std.testing.expectEqual(pinned, rt.roots.items[1]);
+    try std.testing.expectEqual(new_b, pinned.strong.?);
+
+    const after = heap.accounting();
+    try std.testing.expectEqual(before.live_cells - 1, after.live_cells);
+    try std.testing.expectEqual(before.live_bytes - Heap(TestRT).cellAllocationBytes(N), after.live_bytes);
+
+    rt.roots.clearRetainingCapacity();
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 0), heap.accounting().live_cells);
+    try std.testing.expectEqual(@as(usize, 5), rt.finalized.items.len);
+}
+
+test "compaction reports no candidates for an empty or entirely pinned heap" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    try std.testing.expectEqual(
+        Heap(TestRT).CompactionStatus.no_candidates,
+        heap.collectAndCompact().status,
+    );
+    const pinned = try heap.create(TestRT.Node, .node);
+    pinned.* = .{ .id = 99 };
+    try rt.roots.append(a, pinned);
+    const result = heap.collectAndCompact();
+    try std.testing.expectEqual(Heap(TestRT).CompactionStatus.no_candidates, result.status);
+    try std.testing.expectEqual(pinned, rt.roots.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), rt.relocation_reserve_calls);
+}
+
+test "compaction destination OOM rolls back every reservation without graph mutation" {
+    const a = std.testing.allocator;
+    for (0..2) |fail_at| {
+        var rt = TestRT{ .relocation_reserve_limit = fail_at };
+        defer rt.roots.deinit(a);
+        defer rt.finalized.deinit(a);
+        var heap = Heap(TestRT).init(a, &rt);
+        defer heap.deinit();
+
+        const first = try heap.create(TestRT.Node, .node);
+        first.* = .{ .id = 10 };
+        const second = try heap.create(TestRT.Node, .node);
+        second.* = .{ .id = 11 };
+        first.strong = second;
+        second.strong = first;
+        try rt.roots.append(a, first);
+        const before = heap.accounting();
+
+        const result = heap.collectAndCompact();
+        try std.testing.expectEqual(Heap(TestRT).CompactionStatus.out_of_memory, result.status);
+        try std.testing.expectEqual(@as(usize, 0), result.moved_cells);
+        try std.testing.expectEqual(first, rt.roots.items[0]);
+        try std.testing.expectEqual(second, first.strong.?);
+        try std.testing.expectEqual(first, second.strong.?);
+        try std.testing.expectEqual(before.live_cells, heap.accounting().live_cells);
+        try std.testing.expectEqual(before.live_bytes, heap.accounting().live_bytes);
+        try std.testing.expectEqual(fail_at, rt.relocation_reserve_calls);
+        try std.testing.expectEqual(fail_at, rt.relocation_rollbacks);
+        try std.testing.expectEqual(@as(usize, 0), rt.relocation_commits);
+        try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    }
 }
 
 test "post-sweep hook observes finalizers after the parallel allocation lock is released" {
