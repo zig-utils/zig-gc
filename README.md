@@ -206,10 +206,13 @@ sequential failure ordering.
 
 `accounting()` snapshots live/young/promoted totals, collection counts, the
 configured tenuring age, the latest minor survivor/reclamation/promotion bytes,
-and the post-sweep byte size of the last full collection. Old-container and
-conservative-target cards persist while survivors remain young, so an unchanged
-old-to-young edge stays sound across repeated minors. Full collection or nursery
-disable explicitly tenures the remaining young prefix.
+cumulative young-input/survivor/reclamation/promotion bytes across all minor
+cycles, and the post-sweep byte size of the last full collection. The cumulative
+counters are historical and do not reset on a full collection or nursery toggle.
+Old-container and conservative-target cards persist while survivors remain
+young, so an unchanged old-to-young edge stays sound across repeated minors.
+Full collection or nursery disable explicitly tenures the remaining young
+prefix.
 
 ## Status
 

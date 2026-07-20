@@ -329,6 +329,10 @@ pub fn Heap(comptime Binding: type) type {
         last_minor_survived_cells: usize = 0,
         last_minor_survived_bytes: usize = 0,
         last_minor_promoted_bytes: usize = 0,
+        total_minor_young_bytes: usize = 0,
+        total_minor_reclaimed_bytes: usize = 0,
+        total_minor_survived_bytes: usize = 0,
+        total_minor_promoted_bytes: usize = 0,
         nursery_threshold_bytes: usize = default_nursery_threshold_bytes,
         tenuring_age: u8 = default_tenuring_age,
         nursery_enabled: bool = false,
@@ -617,6 +621,12 @@ pub fn Heap(comptime Binding: type) type {
             last_minor_survived_cells: usize,
             last_minor_survived_bytes: usize,
             last_minor_promoted_bytes: usize,
+            /// Historical byte totals across successful minor collections.
+            /// These do not reset during a full collection or nursery toggle.
+            total_minor_young_bytes: usize,
+            total_minor_reclaimed_bytes: usize,
+            total_minor_survived_bytes: usize,
+            total_minor_promoted_bytes: usize,
         };
 
         pub const CompactionStatus = enum {
@@ -654,6 +664,10 @@ pub fn Heap(comptime Binding: type) type {
                 .last_minor_survived_cells = self.last_minor_survived_cells,
                 .last_minor_survived_bytes = self.last_minor_survived_bytes,
                 .last_minor_promoted_bytes = self.last_minor_promoted_bytes,
+                .total_minor_young_bytes = self.total_minor_young_bytes,
+                .total_minor_reclaimed_bytes = self.total_minor_reclaimed_bytes,
+                .total_minor_survived_bytes = self.total_minor_survived_bytes,
+                .total_minor_promoted_bytes = self.total_minor_promoted_bytes,
             };
         }
 
@@ -2207,6 +2221,10 @@ pub fn Heap(comptime Binding: type) type {
                 self.last_minor_survived_cells = cycle_survived_cells;
                 self.last_minor_survived_bytes = cycle_survived_bytes;
                 self.last_minor_promoted_bytes = cycle_promoted_bytes;
+                self.total_minor_young_bytes +|= cycle_young_bytes;
+                self.total_minor_reclaimed_bytes +|= cycle_reclaimed_young_bytes;
+                self.total_minor_survived_bytes +|= cycle_survived_bytes;
+                self.total_minor_promoted_bytes +|= cycle_promoted_bytes;
                 self.nursery_threshold_bytes = self.nextNurseryThreshold(cycle_young_bytes, cycle_survived_bytes);
             } else {
                 self.full_collections += 1;
@@ -3185,6 +3203,7 @@ test "multi-age nursery retains survivors and promotes at the configured age" {
     later_garbage.* = .{ .id = 2 };
     try rt.roots.append(a, survivor);
     try rt.roots.append(a, later_garbage);
+    const node_bytes = heap.young_bytes / 2;
 
     heap.collectYoung();
     try std.testing.expectEqual(@as(usize, 2), heap.young_cells);
@@ -3205,6 +3224,14 @@ test "multi-age nursery retains survivors and promotes at the configured age" {
     try std.testing.expectEqual(@as(u8, 3), stats.tenuring_age);
     try std.testing.expectEqual(@as(usize, 1), stats.last_minor_survived_cells);
     try std.testing.expect(stats.last_minor_promoted_bytes > 0);
+    try std.testing.expectEqual(5 * node_bytes, stats.total_minor_young_bytes);
+    try std.testing.expectEqual(4 * node_bytes, stats.total_minor_survived_bytes);
+    try std.testing.expectEqual(node_bytes, stats.total_minor_reclaimed_bytes);
+    try std.testing.expectEqual(node_bytes, stats.total_minor_promoted_bytes);
+    try std.testing.expectEqual(
+        stats.total_minor_young_bytes,
+        stats.total_minor_survived_bytes + stats.total_minor_reclaimed_bytes,
+    );
     try std.testing.expectEqual(H.tenured_age, H.headerOf(survivor).age);
 }
 
