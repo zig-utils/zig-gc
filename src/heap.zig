@@ -213,22 +213,60 @@ pub fn Heap(comptime Binding: type) type {
         const min_retained_scratch_entries: usize = 4096;
         const publication_shard_count = if (has_owned_cell_iterator) 64 else 0;
 
-        /// One machine-word-ish header in front of every cell: the all-cells
-        /// list link, the payload size (to free), the kind tag (to dispatch
-        /// trace/finalize without RTTI), and the mark bit.
+        /// One fixed 32-byte header on 64-bit targets: stable identity, the
+        /// all-cells link, checked payload size, kind/age, and four independently
+        /// updated concurrent state bits packed into one atomic byte.
         const header_magic: u64 = 0x7a67_6763_5f68_6561;
+        const header_marked: u8 = 1 << 0;
+        const header_young: u8 = 1 << 1;
+        const header_remembered_owner: u8 = 1 << 2;
+        const header_remembered_target: u8 = 1 << 3;
         pub const Header = struct {
             magic: u64,
             stable_id: StableCellId,
             next: ?*Header,
-            size: usize,
+            size: u32,
             kind: Kind,
-            marked: bool,
-            young: bool,
             age: u8,
-            remembered_owner: bool,
-            remembered_target: bool,
+            flags: u8,
         };
+
+        comptime {
+            if (@sizeOf(usize) == 8 and @sizeOf(Header) != 32)
+                @compileError("zig-gc Header must remain 32 bytes on 64-bit targets");
+        }
+
+        inline fn headerFlagLoad(h: *const Header, mask: u8, comptime order: std.builtin.AtomicOrder) bool {
+            return @atomicLoad(u8, &h.flags, order) & mask != 0;
+        }
+
+        inline fn headerPayloadSize(h: *const Header) usize {
+            return h.size;
+        }
+
+        fn headerFlagStore(h: *Header, mask: u8, value: bool, comptime order: std.builtin.AtomicOrder) void {
+            var current = @atomicLoad(u8, &h.flags, .monotonic);
+            while (true) {
+                const updated = if (value) current | mask else current & ~mask;
+                if (@cmpxchgWeak(u8, &h.flags, current, updated, order, .monotonic)) |observed| {
+                    current = observed;
+                    continue;
+                }
+                return;
+            }
+        }
+
+        fn headerFlagSetIfClear(h: *Header, mask: u8, comptime order: std.builtin.AtomicOrder) bool {
+            var current = @atomicLoad(u8, &h.flags, .monotonic);
+            while (true) {
+                if (current & mask != 0) return false;
+                if (@cmpxchgWeak(u8, &h.flags, current, current | mask, order, .monotonic)) |observed| {
+                    current = observed;
+                    continue;
+                }
+                return true;
+            }
+        }
 
         /// Fixed offset from a header to its payload. 16-byte aligned so any
         /// cell whose `@alignOf <= 16` (every normal Zig struct on 64-bit) is
@@ -296,6 +334,8 @@ pub fn Heap(comptime Binding: type) type {
         /// claim all cells use owned storage use this in an exhaustive comptime
         /// proof over their cell taxonomy.
         pub fn cellAllocationBytes(comptime T: type) usize {
+            if (@sizeOf(T) > std.math.maxInt(u32))
+                @compileError("zig-gc cell payload exceeds the 32-bit header size field");
             return header_stride + @sizeOf(T);
         }
 
@@ -454,7 +494,7 @@ pub fn Heap(comptime Binding: type) type {
                 const p = cell orelse return;
                 const h = Self.headerOf(p);
                 if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
-                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &h.young, .monotonic)) return;
+                if (v.heap.collection_kind == .minor and !headerFlagLoad(h, header_young, .monotonic)) return;
                 if (!v.heap.claimMark(h)) return; // already grey/black
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
@@ -481,13 +521,13 @@ pub fn Heap(comptime Binding: type) type {
             /// strong edge; if the key stays white, the entry is weak.
             pub fn isMarked(v: *Visitor, cell: ?*anyopaque) bool {
                 const p = cell orelse return false;
-                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &Self.headerOf(p).young, .monotonic)) return true;
+                if (v.heap.collection_kind == .minor and !headerFlagLoad(Self.headerOf(p), header_young, .monotonic)) return true;
                 // Atomic: the parallel marker reads `marked` (here, in the sweep
                 // phase, and in conservative marking) while a mutator's `claimMark`
                 // write barrier CASes it (`.acq_rel`); a plain read races that. A
                 // relaxed load is a plain mov — the marking-phase handshake already
                 // orders it — so this is free.
-                return @atomicLoad(bool, &Self.headerOf(p).marked, .monotonic);
+                return headerFlagLoad(Self.headerOf(p), header_marked, .monotonic);
             }
 
             /// Conservatively mark a machine word if it points at the payload
@@ -497,7 +537,7 @@ pub fn Heap(comptime Binding: type) type {
             /// teaching the collector about their frame layout.
             pub fn markConservativeWord(v: *Visitor, word: usize) void {
                 const h = v.heap.headerForInteriorAddress(word) orelse return;
-                if (v.heap.collection_kind == .minor and !@atomicLoad(bool, &h.young, .monotonic)) return;
+                if (v.heap.collection_kind == .minor and !headerFlagLoad(h, header_young, .monotonic)) return;
                 // `claimMark` is the atomic CAS under a concurrent/parallel mark
                 // (and a plain check otherwise), so a conservative root claim
                 // can't race a peer mutator's `writeBarrier` claim on the same
@@ -699,14 +739,14 @@ pub fn Heap(comptime Binding: type) type {
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             var it = self.cellIterator();
             while (it.next()) |h| {
-                if (!@atomicLoad(bool, &h.young, .monotonic)) {
+                if (!headerFlagLoad(h, header_young, .monotonic)) {
                     if (owned_enumeration) continue;
                     break;
                 }
-                @atomicStore(bool, &h.young, false, .release);
+                headerFlagStore(h, header_young, false, .release);
                 h.age = tenured_age;
                 promoted_cells += 1;
-                promoted_bytes += header_stride + h.size;
+                promoted_bytes += header_stride + headerPayloadSize(h);
             }
             std.debug.assert(promoted_cells == self.young_cells);
             std.debug.assert(promoted_bytes == self.young_bytes);
@@ -946,16 +986,16 @@ pub fn Heap(comptime Binding: type) type {
         pub fn cellMetadata(self: *Self, payload: ?*anyopaque) ?CellMetadata {
             const ptr = payload orelse return null;
             const h = self.headerForPayload(ptr) orelse return null;
-            return .{ .id = h.stable_id, .kind = h.kind, .size = h.size };
+            return .{ .id = h.stable_id, .kind = h.kind, .size = headerPayloadSize(h) };
         }
 
         fn indexPayloadLocked(self: *Self, h: *Header) void {
-            if (self.bindingUsesOwnedCellStorage(header_stride + h.size)) return;
+            if (self.bindingUsesOwnedCellStorage(header_stride + headerPayloadSize(h))) return;
             self.payload_index.put(self.backing, payloadKey(payloadOf(h)), h) catch {};
         }
 
         fn unindexPayloadLocked(self: *Self, h: *Header) void {
-            if (self.bindingUsesOwnedCellStorage(header_stride + h.size)) return;
+            if (self.bindingUsesOwnedCellStorage(header_stride + headerPayloadSize(h))) return;
             _ = self.payload_index.remove(payloadKey(payloadOf(h)));
         }
 
@@ -968,8 +1008,8 @@ pub fn Heap(comptime Binding: type) type {
         /// buffer it points into. Call only with marks still valid (before sweep).
         pub fn isLive(self: *Self, p: ?*anyopaque) bool {
             const ptr = p orelse return false;
-            if (self.collection_kind == .minor and !@atomicLoad(bool, &headerOf(ptr).young, .monotonic)) return true;
-            return @atomicLoad(bool, &headerOf(ptr).marked, .monotonic); // vs concurrent claimMark CAS
+            if (self.collection_kind == .minor and !headerFlagLoad(headerOf(ptr), header_young, .monotonic)) return true;
+            return headerFlagLoad(headerOf(ptr), header_marked, .monotonic); // vs concurrent claimMark CAS
         }
 
         fn headerForInteriorAddress(self: *Self, address: usize) ?*Header {
@@ -978,7 +1018,7 @@ pub fn Heap(comptime Binding: type) type {
                     const h: *Header = @ptrCast(@alignCast(base));
                     if (h.magic != header_magic) return null;
                     const start = @intFromPtr(payloadOf(h));
-                    const size = if (h.size == 0) 1 else h.size;
+                    const size = @max(headerPayloadSize(h), 1);
                     return if (address >= start and address < start + size) h else null;
                 },
                 .owned_empty => return null,
@@ -1016,7 +1056,7 @@ pub fn Heap(comptime Binding: type) type {
                 // A zero-size payload would make an empty extent that no interior
                 // address can fall into; record at least one byte so an exact
                 // payload pointer still resolves.
-                const size = if (h.size == 0) 1 else h.size;
+                const size = @max(headerPayloadSize(h), 1);
                 self.addr_index.append(self.aux, .{
                     .start = start,
                     .end = start + size,
@@ -1053,7 +1093,7 @@ pub fn Heap(comptime Binding: type) type {
         /// snapshot for the complete publication batch.
         inline fn publishCellLocked(self: *Self, comptime T: type, kind: Kind, h: *Header, born_grey: bool, publish_binding: bool) *T {
             const total = cellAllocationBytes(T);
-            // Field-wise init (not a struct literal) so `marked` is written
+            // Field-wise init (not a struct literal) so packed flags are written
             // *atomically*: under a parallel concurrent mark the marker may
             // `claimMark` this born-grey cell (an atomic CAS) the instant a peer
             // links it behind a traced object, and a non-atomic store racing
@@ -1066,13 +1106,11 @@ pub fn Heap(comptime Binding: type) type {
             h.stable_id = allocateStableCellId();
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             h.next = if (owned_enumeration) null else self.all;
-            h.size = @sizeOf(T);
+            h.size = @intCast(@sizeOf(T));
             h.kind = kind;
-            @atomicStore(bool, &h.marked, born_grey, .release);
-            @atomicStore(bool, &h.young, self.nursery_enabled, .release);
+            @atomicStore(u8, &h.flags, (if (born_grey) header_marked else 0) |
+                (if (self.nursery_enabled) header_young else 0), .release);
             h.age = if (self.nursery_enabled) 0 else tenured_age;
-            @atomicStore(bool, &h.remembered_owner, false, .release);
-            @atomicStore(bool, &h.remembered_target, false, .release);
             // An owned backing may reserve a slot before this private header is
             // initialized. Publish only after every field is complete so its
             // classifier's synchronization makes later header reads race-free.
@@ -1197,13 +1235,10 @@ pub fn Heap(comptime Binding: type) type {
                         h.magic = header_magic;
                         h.stable_id = allocateStableCellId();
                         h.next = null;
-                        h.size = @sizeOf(T);
+                        h.size = @intCast(@sizeOf(T));
                         h.kind = kind;
-                        @atomicStore(bool, &h.marked, false, .release);
-                        @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                        @atomicStore(u8, &h.flags, if (nursery_snapshot) header_young else 0, .release);
                         h.age = if (nursery_snapshot) 0 else tenured_age;
-                        @atomicStore(bool, &h.remembered_owner, false, .release);
-                        @atomicStore(bool, &h.remembered_target, false, .release);
                     }
                     const raw: []*anyopaque = @as([*]*anyopaque, @ptrCast(out.ptr))[0..out.len];
                     self.bindingPublishCellAllocationBatch(raw, total, header_stride);
@@ -1219,13 +1254,10 @@ pub fn Heap(comptime Binding: type) type {
                     h.magic = header_magic;
                     h.stable_id = allocateStableCellId();
                     h.next = if (owned_enumeration) null else private_head;
-                    h.size = @sizeOf(T);
+                    h.size = @intCast(@sizeOf(T));
                     h.kind = kind;
-                    @atomicStore(bool, &h.marked, false, .release);
-                    @atomicStore(bool, &h.young, nursery_snapshot, .release);
+                    @atomicStore(u8, &h.flags, if (nursery_snapshot) header_young else 0, .release);
                     h.age = if (nursery_snapshot) 0 else tenured_age;
-                    @atomicStore(bool, &h.remembered_owner, false, .release);
-                    @atomicStore(bool, &h.remembered_target, false, .release);
                     if (!owned_enumeration) {
                         if (private_tail == null) private_tail = h;
                         private_head = h;
@@ -1312,10 +1344,10 @@ pub fn Heap(comptime Binding: type) type {
         pub fn writeBarrierFromManaged(self: *Self, owner: *anyopaque, cell: *anyopaque) void {
             const child = headerOf(cell);
             std.debug.assert(child.magic == header_magic);
-            if (self.nursery_enabled and @atomicLoad(bool, &child.young, .acquire)) {
+            if (self.nursery_enabled and headerFlagLoad(child, header_young, .acquire)) {
                 const parent = headerOf(owner);
                 std.debug.assert(parent.magic == header_magic);
-                if (!@atomicLoad(bool, &parent.young, .acquire)) self.rememberOwner(parent);
+                if (!headerFlagLoad(parent, header_young, .acquire)) self.rememberOwner(parent);
             }
             if (!self.marking.load(.acquire)) return;
             self.incrementalBarrierHeader(child);
@@ -1334,37 +1366,37 @@ pub fn Heap(comptime Binding: type) type {
                 self.nursery_force_full.store(true, .release);
                 return;
             };
-            if (!@atomicLoad(bool, &h.young, .acquire)) self.rememberOwner(h);
+            if (!headerFlagLoad(h, header_young, .acquire)) self.rememberOwner(h);
         }
 
         fn rememberStrongStore(self: *Self, owner: ?*anyopaque, cell: ?*anyopaque) void {
             if (!self.nursery_enabled) return;
             const child_ptr = cell orelse return;
             const child = self.headerForPayload(child_ptr) orelse return;
-            if (!@atomicLoad(bool, &child.young, .acquire)) return;
+            if (!headerFlagLoad(child, header_young, .acquire)) return;
             if (owner) |owner_ptr| {
                 if (self.headerForPayload(owner_ptr)) |parent| {
-                    if (!@atomicLoad(bool, &parent.young, .acquire)) self.rememberOwner(parent);
+                    if (!headerFlagLoad(parent, header_young, .acquire)) self.rememberOwner(parent);
                     return;
                 }
             }
             // Compatibility path for embedders that only provide the child. It
             // is conservative but sound: retain that target for this nursery
             // cycle, then tenure it and discard the entry.
-            if (@cmpxchgStrong(bool, &child.remembered_target, false, true, .acq_rel, .monotonic) != null) return;
+            if (!headerFlagSetIfClear(child, header_remembered_target, .acq_rel)) return;
             self.lockRemember();
             self.remembered_targets.append(self.aux, child) catch {
-                @atomicStore(bool, &child.remembered_target, false, .release);
+                headerFlagStore(child, header_remembered_target, false, .release);
                 self.nursery_force_full.store(true, .release);
             };
             self.unlockRemember();
         }
 
         fn rememberOwner(self: *Self, h: *Header) void {
-            if (@cmpxchgStrong(bool, &h.remembered_owner, false, true, .acq_rel, .monotonic) != null) return;
+            if (!headerFlagSetIfClear(h, header_remembered_owner, .acq_rel)) return;
             self.lockRemember();
             self.remembered_owners.append(self.aux, h) catch {
-                @atomicStore(bool, &h.remembered_owner, false, .release);
+                headerFlagStore(h, header_remembered_owner, false, .release);
                 self.nursery_force_full.store(true, .release);
             };
             self.unlockRemember();
@@ -1406,12 +1438,12 @@ pub fn Heap(comptime Binding: type) type {
         /// single-threaded path is a plain check.
         fn claimMark(self: *Self, h: *Header) bool {
             if (self.parallel or self.concurrent.load(.acquire)) {
-                if (@cmpxchgStrong(bool, &h.marked, false, true, .acq_rel, .monotonic) != null) return false;
+                if (!headerFlagSetIfClear(h, header_marked, .acq_rel)) return false;
                 _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
                 return true;
             }
-            if (h.marked) return false;
-            h.marked = true;
+            if (headerFlagLoad(h, header_marked, .monotonic)) return false;
+            headerFlagStore(h, header_marked, true, .monotonic);
             self.marked_count += 1;
             return true;
         }
@@ -1465,7 +1497,7 @@ pub fn Heap(comptime Binding: type) type {
             self.collection_kind = .full;
             _ = self.closeAndFoldPublicationShards();
             var it = self.cellIterator();
-            while (it.next()) |h| h.marked = false;
+            while (it.next()) |h| headerFlagStore(h, header_marked, false, .monotonic);
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             // Reserve the mark stack to the live-cell count up front — the grey
@@ -1580,7 +1612,7 @@ pub fn Heap(comptime Binding: type) type {
             while (cells.next()) |old_header| {
                 const old_payload = payloadOf(old_header);
                 if (!Binding.canRelocate(self.ctx, old_payload, old_header.kind)) continue;
-                const total = header_stride + old_header.size;
+                const total = header_stride + headerPayloadSize(old_header);
                 const new_header = self.reserveRelocationCell(total) orelse {
                     for (records.items) |record|
                         self.releaseRelocationReservation(headerOf(record.new_payload), header_stride + record.size);
@@ -1593,7 +1625,7 @@ pub fn Heap(comptime Binding: type) type {
                 records.appendAssumeCapacity(.{
                     .id = old_header.stable_id,
                     .kind = old_header.kind,
-                    .size = old_header.size,
+                    .size = headerPayloadSize(old_header),
                     .old_payload = old_payload,
                     .new_payload = new_payload,
                 });
@@ -1691,14 +1723,14 @@ pub fn Heap(comptime Binding: type) type {
             if (owned_enumeration) {
                 var cells = self.cellIterator();
                 while (cells.next()) |h| {
-                    if (@atomicLoad(bool, &h.young, .monotonic))
-                        @atomicStore(bool, &h.marked, false, .monotonic);
+                    if (headerFlagLoad(h, header_young, .monotonic))
+                        headerFlagStore(h, header_marked, false, .monotonic);
                 }
             } else {
                 old_head = self.all;
                 while (old_head) |h| {
-                    if (!@atomicLoad(bool, &h.young, .monotonic)) break;
-                    @atomicStore(bool, &h.marked, false, .monotonic);
+                    if (!headerFlagLoad(h, header_young, .monotonic)) break;
+                    headerFlagStore(h, header_marked, false, .monotonic);
                     old_head = h.next;
                 }
             }
@@ -1729,7 +1761,7 @@ pub fn Heap(comptime Binding: type) type {
                 if (owned_enumeration) {
                     var old_it = self.cellIterator();
                     while (old_it.next()) |h| {
-                        if (!@atomicLoad(bool, &h.young, .monotonic) and Binding.traceOldOnMinor(h.kind))
+                        if (!headerFlagLoad(h, header_young, .monotonic) and Binding.traceOldOnMinor(h.kind))
                             self.rememberOwner(h);
                     }
                 } else {
@@ -1741,7 +1773,7 @@ pub fn Heap(comptime Binding: type) type {
             }
             self.lockRemember();
             for (self.remembered_owners.items) |h| {
-                if (h.magic == header_magic and !@atomicLoad(bool, &h.young, .monotonic))
+                if (h.magic == header_magic and !headerFlagLoad(h, header_young, .monotonic))
                     Binding.trace(payloadOf(h), h.kind, &v);
             }
             for (self.remembered_targets.items) |h| v.mark(payloadOf(h));
@@ -1821,7 +1853,7 @@ pub fn Heap(comptime Binding: type) type {
             // Atomic store: a lagging peer's `claimMark` CAS (barrier path, no
             // `alloc_lock`) can touch the same `marked` byte concurrently. See
             // the whiten note in the doc comment above.
-            while (it.next()) |h| @atomicStore(bool, &h.marked, false, .monotonic);
+            while (it.next()) |h| headerFlagStore(h, header_marked, false, .monotonic);
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
             // Pre-reserve the mark stack to the live-cell count (see the note in
@@ -2167,21 +2199,21 @@ pub fn Heap(comptime Binding: type) type {
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
             var cells = self.cellIterator();
             while (cells.next()) |h| {
-                const young = @atomicLoad(bool, &h.young, .monotonic);
+                const young = headerFlagLoad(h, header_young, .monotonic);
                 if (minor and !young) {
                     if (owned_enumeration) continue;
                     break;
                 }
                 const next = h.next;
-                const total = header_stride + h.size;
+                const total = header_stride + headerPayloadSize(h);
                 if (minor and young) cycle_young_bytes += total;
-                if (@atomicLoad(bool, &h.marked, .monotonic)) {
+                if (headerFlagLoad(h, header_marked, .monotonic)) {
                     if (young) {
                         cycle_survived_cells += 1;
                         cycle_survived_bytes += total;
                         const next_age = h.age + 1;
                         if (!minor or next_age >= self.tenuring_age) {
-                            @atomicStore(bool, &h.young, false, .release);
+                            headerFlagStore(h, header_young, false, .release);
                             h.age = tenured_age;
                             cycle_promoted_cells += 1;
                             cycle_promoted_bytes += total;
@@ -2272,15 +2304,15 @@ pub fn Heap(comptime Binding: type) type {
         }
 
         fn shouldProcessMarkedCell(self: *Self, h: *Header) bool {
-            if (self.collection_kind == .full) return @atomicLoad(bool, &h.marked, .monotonic);
-            if (@atomicLoad(bool, &h.young, .monotonic)) return @atomicLoad(bool, &h.marked, .monotonic);
-            return @atomicLoad(bool, &h.remembered_owner, .monotonic);
+            if (self.collection_kind == .full) return headerFlagLoad(h, header_marked, .monotonic);
+            if (headerFlagLoad(h, header_young, .monotonic)) return headerFlagLoad(h, header_marked, .monotonic);
+            return headerFlagLoad(h, header_remembered_owner, .monotonic);
         }
 
         fn clearRemembered(self: *Self) void {
             self.lockRemember();
-            for (self.remembered_owners.items) |h| @atomicStore(bool, &h.remembered_owner, false, .release);
-            for (self.remembered_targets.items) |h| @atomicStore(bool, &h.remembered_target, false, .release);
+            for (self.remembered_owners.items) |h| headerFlagStore(h, header_remembered_owner, false, .release);
+            for (self.remembered_targets.items) |h| headerFlagStore(h, header_remembered_target, false, .release);
             self.remembered_owners.clearRetainingCapacity();
             self.remembered_targets.clearRetainingCapacity();
             self.unlockRemember();
@@ -2297,13 +2329,13 @@ pub fn Heap(comptime Binding: type) type {
             var retained: usize = 0;
             for (self.remembered_targets.items) |h| {
                 const live_young = h.magic == header_magic and
-                    @atomicLoad(bool, &h.young, .monotonic) and
-                    @atomicLoad(bool, &h.marked, .monotonic);
+                    headerFlagLoad(h, header_young, .monotonic) and
+                    headerFlagLoad(h, header_marked, .monotonic);
                 if (live_young) {
                     self.remembered_targets.items[retained] = h;
                     retained += 1;
                 } else if (h.magic == header_magic) {
-                    @atomicStore(bool, &h.remembered_target, false, .release);
+                    headerFlagStore(h, header_remembered_target, false, .release);
                 }
             }
             self.remembered_targets.items.len = retained;
@@ -2342,10 +2374,10 @@ pub fn Heap(comptime Binding: type) type {
             _ = self.closeAndFoldPublicationShards();
             var cells = self.cellIterator();
             while (cells.next()) |h| {
-                self.bindingUnpublishCellAllocation(h, header_stride + h.size);
+                self.bindingUnpublishCellAllocation(h, header_stride + headerPayloadSize(h));
                 Binding.finalize(self.ctx, payloadOf(h), h.kind);
                 if (free_cell_storage) {
-                    const total = header_stride + h.size;
+                    const total = header_stride + headerPayloadSize(h);
                     const base: [*]align(16) u8 = @ptrCast(@alignCast(h));
                     self.backing.free(base[0..total]);
                 }
@@ -2924,6 +2956,34 @@ test "stable cell metadata is process-unique, batched, and never recycled" {
     const replacement = try first.create(N, .node);
     replacement.* = .{ .id = 21 };
     try std.testing.expect(first.cellMetadata(replacement).?.id != doomed_id);
+}
+
+test "64-bit header stays 32 bytes and packed flags transition independently" {
+    const H = Heap(TestRT);
+    if (@sizeOf(usize) == 8) try std.testing.expectEqual(@as(usize, 32), @sizeOf(H.Header));
+
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const node = try heap.create(TestRT.Node, .node);
+    node.* = .{ .id = 1 };
+    const header = H.headerOf(node);
+    try std.testing.expect(H.headerFlagLoad(header, H.header_young, .acquire));
+    try std.testing.expect(!H.headerFlagLoad(header, H.header_marked, .acquire));
+    try std.testing.expect(H.headerFlagSetIfClear(header, H.header_marked, .acq_rel));
+    try std.testing.expect(!H.headerFlagSetIfClear(header, H.header_marked, .acq_rel));
+    try std.testing.expect(H.headerFlagSetIfClear(header, H.header_remembered_owner, .acq_rel));
+    try std.testing.expect(H.headerFlagSetIfClear(header, H.header_remembered_target, .acq_rel));
+    H.headerFlagStore(header, H.header_marked, false, .release);
+    try std.testing.expect(!H.headerFlagLoad(header, H.header_marked, .acquire));
+    try std.testing.expect(H.headerFlagLoad(header, H.header_young, .acquire));
+    try std.testing.expect(H.headerFlagLoad(header, H.header_remembered_owner, .acquire));
+    try std.testing.expect(H.headerFlagLoad(header, H.header_remembered_target, .acquire));
 }
 
 test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear" {
@@ -4157,7 +4217,11 @@ test "incremental mark: cells allocated mid-cycle are born grey and survive" {
     // survives this cycle and its creation-time fields would be traced.
     const fresh = try heap.create(N, .node);
     fresh.* = .{ .id = 2 };
-    try std.testing.expect(Heap(TestRT).headerOf(fresh).marked);
+    try std.testing.expect(Heap(TestRT).headerFlagLoad(
+        Heap(TestRT).headerOf(fresh),
+        Heap(TestRT).header_marked,
+        .monotonic,
+    ));
 
     heap.finishMarking();
     try std.testing.expectEqual(@as(usize, 2), heap.live_cells); // root + fresh
@@ -4622,7 +4686,11 @@ test "owned createBatch keeps the marking publication fallback" {
     var header = heap.all;
     var count: usize = 0;
     while (header) |h| : (header = h.next) {
-        try std.testing.expect(@atomicLoad(bool, &h.marked, .acquire));
+        try std.testing.expect(Heap(BatchAllocTestRT).headerFlagLoad(
+            h,
+            Heap(BatchAllocTestRT).header_marked,
+            .acquire,
+        ));
         count += 1;
     }
     try std.testing.expectEqual(nodes.len, count);
@@ -4819,7 +4887,7 @@ test "parallel concurrent mark: stale barrier append after abort is ignored" {
     const node = try heap.create(TestRT.Node, .node);
     node.* = .{ .id = 42 };
     const hdr = Heap(TestRT).headerOf(node);
-    @atomicStore(bool, &hdr.marked, false, .monotonic);
+    Heap(TestRT).headerFlagStore(hdr, Heap(TestRT).header_marked, false, .monotonic);
     heap.marked_count = 0;
     heap.marking.store(true, .release);
     heap.concurrent.store(true, .release);
@@ -4835,7 +4903,7 @@ test "parallel concurrent mark: stale barrier append after abort is ignored" {
     var worker = Worker{ .heap = &heap, .node = node };
     const t = try std.Thread.spawn(.{}, Worker.run, .{&worker});
 
-    while (!@atomicLoad(bool, &hdr.marked, .acquire)) std.atomic.spinLoopHint();
+    while (!Heap(TestRT).headerFlagLoad(hdr, Heap(TestRT).header_marked, .acquire)) std.atomic.spinLoopHint();
     heap.marking.store(false, .release);
     heap.concurrent.store(false, .release);
     heap.barrier_buf.clearRetainingCapacity();

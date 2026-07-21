@@ -199,7 +199,10 @@ before the next collection so a cycle never traces a half-built cell. Batched
 creation allocates private slabs first, then publishes their headers, all-cells
 links, nursery accounting, and born-grey state under one metadata lock; large
 all-owned batches use the O(1) splice described above. Cells are 16-byte aligned
-with a single-word header; recovering a header from a payload is O(1). A short
+behind a 32-byte header on 64-bit targets. That header includes a process-unique
+relocation-stable ID, checked 32-bit payload size, kind, generation age, and one
+atomic byte for mark/young/remembered flags; recovering it from a payload is
+O(1). A short
 batch reports its successfully published prefix so the caller can commit that
 work before the next allocation performs recovery or reports OOM, preserving
 sequential failure ordering.
