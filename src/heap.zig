@@ -34,6 +34,7 @@
 //!   fn reserveRelocationCell(ctx: *B, total: usize) ?*anyopaque;
 //!   fn releaseRelocationReservation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!   fn commitRelocationCell(ctx: *B, old: *anyopaque, new: *anyopaque, total: usize) void;
+//!   fn collectionPhaseBoundary(ctx: *B, boundary: CollectionPhaseBoundary) void;
 //!
 //! Inside trace/traceRoots the binding calls `v.mark(ptr)` for each strong
 //! reference and `v.markWeak(&slot)` for each weak slot (`*?*anyopaque`).
@@ -42,6 +43,23 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+/// Semantic collection boundaries for opt-in embedder profiling. The generic
+/// heap deliberately owns no clock or counters; bindings that omit the hook pay
+/// no runtime cost. `prepare_begin` is emitted only after a collection is known
+/// to run, and `post_sweep_end` follows the optional `afterSweep` hook.
+pub const CollectionPhaseBoundary = enum {
+    full_prepare_begin,
+    full_trace_begin,
+    full_sweep_begin,
+    full_sweep_end,
+    full_post_sweep_end,
+    minor_prepare_begin,
+    minor_trace_begin,
+    minor_sweep_begin,
+    minor_sweep_end,
+    minor_post_sweep_end,
+};
 
 /// Optional binding result for conservative interior-address classification.
 /// `allocation` is the exact cell allocation base (the header address), while
@@ -1491,9 +1509,15 @@ pub fn Heap(comptime Binding: type) type {
             self.alloc_lock.store(0, .release);
         }
 
+        inline fn publishCollectionPhase(self: *Self, boundary: CollectionPhaseBoundary) void {
+            if (comptime @hasDecl(Binding, "collectionPhaseBoundary"))
+                Binding.collectionPhaseBoundary(self.ctx, boundary);
+        }
+
         /// Begin an incremental mark: whiten all cells and grey the roots. The
         /// mutator then runs between `markStep`s with the `writeBarrier` active.
         pub fn startMarking(self: *Self) void {
+            self.publishCollectionPhase(.full_prepare_begin);
             self.collection_kind = .full;
             _ = self.closeAndFoldPublicationShards();
             var it = self.cellIterator();
@@ -1525,6 +1549,7 @@ pub fn Heap(comptime Binding: type) type {
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
+            self.publishCollectionPhase(.full_trace_begin);
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
         }
@@ -1561,9 +1586,12 @@ pub fn Heap(comptime Binding: type) type {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
             self.marking.store(false, .release);
+            self.publishCollectionPhase(.full_sweep_begin);
             self.sweepPhase(&v);
+            self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.runAfterSweep();
+            self.publishCollectionPhase(.full_post_sweep_end);
         }
 
         /// A full stop-the-world cycle: mark from roots, clear dead weak edges,
@@ -1715,6 +1743,7 @@ pub fn Heap(comptime Binding: type) type {
                 return;
             }
 
+            self.publishCollectionPhase(.minor_prepare_begin);
             if (self.parallel) self.lockAlloc();
             _ = self.closeAndFoldPublicationShards();
             self.collection_kind = .minor;
@@ -1750,6 +1779,7 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(true, .release);
             if (self.parallel) self.unlockAlloc();
 
+            self.publishCollectionPhase(.minor_trace_begin);
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
             // Bindings may identify mutable side-cell kinds whose post-creation
@@ -1781,10 +1811,13 @@ pub fn Heap(comptime Binding: type) type {
             while (self.mark_stack.pop()) |h| Binding.trace(payloadOf(h), h.kind, &v);
             self.retainRememberedForMinorSweep();
             self.marking.store(false, .release);
+            self.publishCollectionPhase(.minor_sweep_begin);
             self.sweepPhase(&v);
+            self.publishCollectionPhase(.minor_sweep_end);
             self.collection_kind = .full;
             self.reopenShardedPublication();
             self.runAfterSweep();
+            self.publishCollectionPhase(.minor_post_sweep_end);
         }
 
         // ---- Concurrent marking (M3) -------------------------------------
@@ -1846,6 +1879,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Requires `parallel`.
         pub fn beginConcurrentMarkParallel(self: *Self) void {
             std.debug.assert(self.parallel);
+            self.publishCollectionPhase(.full_prepare_begin);
             self.collection_kind = .full;
             self.lockAlloc();
             _ = self.closeAndFoldPublicationShards();
@@ -1882,6 +1916,7 @@ pub fn Heap(comptime Binding: type) type {
             // pushes there; peers route through `barrier_buf`). Mark claims are
             // atomic now that `concurrent` is set, so this is safe to run while
             // peers allocate.
+            self.publishCollectionPhase(.full_trace_begin);
             var v = Visitor{ .heap = self };
             Binding.traceRoots(self.ctx, &v);
         }
@@ -1931,9 +1966,12 @@ pub fn Heap(comptime Binding: type) type {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
             self.marking.store(false, .release);
+            self.publishCollectionPhase(.full_sweep_begin);
             self.sweepPhase(&v);
+            self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.runAfterSweep();
+            self.publishCollectionPhase(.full_post_sweep_end);
         }
 
         /// Pending mutator-allocated cells not yet folded into the mark (M3
@@ -2023,10 +2061,13 @@ pub fn Heap(comptime Binding: type) type {
             // while still holding `alloc_lock` (so the all-list is stable).
             self.marking.store(false, .release);
             self.concurrent.store(false, .release);
+            self.publishCollectionPhase(.full_sweep_begin);
             self.sweepPhaseLocked(&v); // alloc_lock already held
+            self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.unlockAlloc();
             self.runAfterSweep();
+            self.publishCollectionPhase(.full_post_sweep_end);
             return true;
         }
 
@@ -2471,6 +2512,9 @@ const TestRT = struct {
     after_sweep_under_alloc_lock: bool = false,
     publication_gate_probe: ?*std.atomic.Value(bool) = null,
     after_sweep_before_publication_reopened: bool = false,
+    collection_phase_boundaries: [64]CollectionPhaseBoundary = undefined,
+    collection_phase_boundary_len: usize = 0,
+    phase_boundary_len_at_after_sweep: usize = 0,
     relocation_reserve_limit: usize = std.math.maxInt(usize),
     relocation_reserve_calls: usize = 0,
     relocation_rollbacks: usize = 0,
@@ -2490,11 +2534,19 @@ const TestRT = struct {
 
     pub fn afterSweep(self: *TestRT) void {
         self.after_sweep_calls += 1;
+        self.phase_boundary_len_at_after_sweep = self.collection_phase_boundary_len;
         self.finalized_at_last_after_sweep = self.finalized.items.len;
         if (self.alloc_lock_probe) |lock|
             self.after_sweep_under_alloc_lock = lock.load(.monotonic) != 0;
         if (self.publication_gate_probe) |gate|
             self.after_sweep_before_publication_reopened = !gate.load(.acquire);
+    }
+
+    pub fn collectionPhaseBoundary(self: *TestRT, boundary: CollectionPhaseBoundary) void {
+        if (self.collection_phase_boundary_len < self.collection_phase_boundaries.len) {
+            self.collection_phase_boundaries[self.collection_phase_boundary_len] = boundary;
+            self.collection_phase_boundary_len += 1;
+        }
     }
 
     pub fn trace(cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -3190,6 +3242,49 @@ test "post-sweep hook observes finalizers after the parallel allocation lock is 
     try std.testing.expectEqual(@as(usize, 3), rt.finalized_at_last_after_sweep);
     try std.testing.expect(!rt.after_sweep_under_alloc_lock);
     try std.testing.expect(!rt.after_sweep_before_publication_reopened);
+}
+
+test "collection phase boundaries distinguish minor and force-full ordering" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    // Disabled and empty nursery calls are true no-ops for observers.
+    heap.collectYoung();
+    heap.setNurseryEnabled(true);
+    heap.collectYoung();
+    try std.testing.expectEqual(@as(usize, 0), rt.collection_phase_boundary_len);
+
+    const nursery_garbage = try heap.create(TestRT.Node, .node);
+    nursery_garbage.* = .{ .id = 41 };
+    heap.collectYoung();
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .minor_prepare_begin,
+        .minor_trace_begin,
+        .minor_sweep_begin,
+        .minor_sweep_end,
+        .minor_post_sweep_end,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+    // `afterSweep` runs between the sweep-end and post-sweep-end boundaries.
+    try std.testing.expectEqual(@as(usize, 4), rt.phase_boundary_len_at_after_sweep);
+
+    rt.collection_phase_boundary_len = 0;
+    const full_garbage = try heap.create(TestRT.Node, .node);
+    full_garbage.* = .{ .id = 42 };
+    heap.nursery_force_full.store(true, .release);
+    heap.collectYoung();
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .full_prepare_begin,
+        .full_trace_begin,
+        .full_sweep_begin,
+        .full_sweep_end,
+        .full_post_sweep_end,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+    try std.testing.expectEqual(@as(usize, 4), rt.phase_boundary_len_at_after_sweep);
 }
 
 test "deinit finalizes every remaining cell" {

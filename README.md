@@ -124,6 +124,18 @@ their own shard, while a collector closes the gate, drains active publishers,
 and folds all deltas once before marking. Active marking retains the serialized
 born-grey path.
 
+Embedders may profile collection work without putting a clock in the generic
+heap by implementing:
+
+```zig
+fn collectionPhaseBoundary(ctx: *B, boundary: gc.CollectionPhaseBoundary) void;
+```
+
+The full/minor prepare, trace, sweep, and post-sweep boundaries describe exact
+collector ordering; the post-sweep event follows `afterSweep`. Empty nursery
+calls emit nothing, and a forced full fallback emits only full boundaries. The
+hook is resolved at comptime and compiles away entirely when absent.
+
 ### Optional relocation
 
 A binding opts into `collectAndCompact()` only by defining all three graph
