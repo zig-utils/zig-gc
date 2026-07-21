@@ -136,14 +136,6 @@ collector ordering; the post-sweep event follows `afterSweep`. Empty nursery
 calls emit nothing, and a forced full fallback emits only full boundaries. The
 hook is resolved at comptime and compiles away entirely when absent.
 
-Bindings with authoritative address-ordered `ownedCellIterator` storage may
-also implement `unpublishCellAllocationBatch(ctx, total, allocations)`. Sweep
-passes consecutive dead same-size runs (up to 1,024 cells) through that hook
-before any finalizer, then retires each header in normal order and calls the
-existing `freeCellStorageBatch` hook. This permits whole-slab ownership resets
-without changing finalization, weak processing, accounting, or generic heaps;
-bindings without both owned iteration and the batch hook keep the per-cell path.
-
 ### Optional relocation
 
 A binding opts into `collectAndCompact()` only by defining all three graph

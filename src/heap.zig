@@ -25,7 +25,6 @@
 //!   fn publishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
 //!   fn publishCellAllocationBatch(ctx: *B, payloads: []*anyopaque, total: usize, payload_offset: usize) void;
 //!   fn unpublishCellAllocation(ctx: *B, allocation: *anyopaque, total: usize) void;
-//!   fn unpublishCellAllocationBatch(ctx: *B, total: usize, allocations: []*anyopaque) void;
 //!   fn ownedCellIterator(ctx: *B) Iterator; // Iterator.next() ?*anyopaque
 //!   fn canRelocate(ctx: *B, cell: *anyopaque, kind: Kind) bool;
 //!   fn relocateRoots(ctx: *B, v: anytype) void;
@@ -971,14 +970,6 @@ pub fn Heap(comptime Binding: type) type {
         inline fn bindingUnpublishCellAllocation(self: *Self, allocation: *anyopaque, total: usize) void {
             if (@hasDecl(Binding, "unpublishCellAllocation"))
                 self.ctx.unpublishCellAllocation(allocation, total);
-        }
-
-        inline fn bindingUnpublishCellAllocationBatch(self: *Self, total: usize, allocations: []*anyopaque) void {
-            if (@hasDecl(Binding, "unpublishCellAllocationBatch")) {
-                self.ctx.unpublishCellAllocationBatch(total, allocations);
-            } else {
-                for (allocations) |allocation| self.bindingUnpublishCellAllocation(allocation, total);
-            }
         }
 
         fn syncAllocMetadata(self: *Self) bool {
@@ -2163,39 +2154,6 @@ pub fn Heap(comptime Binding: type) type {
             if (@hasDecl(Binding, "afterSweep")) Binding.afterSweep(self.ctx);
         }
 
-        /// Retire one address-local, same-size run supplied by an authoritative
-        /// owned-cell iterator. Classification is withdrawn for the complete
-        /// run before the first finalizer executes; storage reuse remains after
-        /// every finalizer, payload-index removal, and header retirement.
-        fn sweepDeadOwnedRun(
-            self: *Self,
-            total: usize,
-            allocations: []*anyopaque,
-            reclaimed_cells: *usize,
-            reclaimed_bytes: *usize,
-            reclaimed_young_bytes: *usize,
-        ) void {
-            self.bindingUnpublishCellAllocationBatch(total, allocations);
-            for (allocations) |allocation| {
-                const h: *Header = @ptrCast(@alignCast(allocation));
-                const young = headerFlagLoad(h, header_young, .monotonic);
-                Binding.finalize(self.ctx, payloadOf(h), h.kind);
-                self.unindexPayloadLocked(h);
-                h.magic = 0;
-                reclaimed_cells.* += 1;
-                reclaimed_bytes.* += total;
-                if (young) reclaimed_young_bytes.* += total;
-            }
-            if (@hasDecl(Binding, "freeCellStorageBatch")) {
-                Binding.freeCellStorageBatch(self.ctx, total, allocations);
-            } else {
-                for (allocations) |allocation| {
-                    const base: [*]align(16) u8 = @ptrCast(@alignCast(allocation));
-                    self.backing.free(base[0..total]);
-                }
-            }
-        }
-
         /// The sweep tail proper, assuming `alloc_lock` is already held under
         /// `parallel` (the parallel finish holds it across its born-empty check
         /// and the sweep so no cell is born in between).
@@ -2278,25 +2236,12 @@ pub fn Heap(comptime Binding: type) type {
             var release_batch: [release_batch_capacity]*anyopaque = undefined;
             var release_batch_len: usize = 0;
             var release_batch_bytes: usize = 0;
-            // The largest default owned slab contains 1,024 64-byte cells.
-            // This fixed scratch admits a complete chunk without collector
-            // allocation; bindings decide whether a run is actually eligible
-            // for whole-run reclamation.
-            const owned_run_capacity = 1024;
-            var owned_run: [owned_run_capacity]*anyopaque = undefined;
-            var owned_run_len: usize = 0;
-            var owned_run_bytes: usize = 0;
             var prev: ?*Header = null;
             const owned_enumeration = self.bindingEnumeratesOwnedCells();
-            const batch_owned_runs = owned_enumeration and @hasDecl(Binding, "unpublishCellAllocationBatch");
             var cells = self.cellIterator();
             while (cells.next()) |h| {
                 const young = headerFlagLoad(h, header_young, .monotonic);
                 if (minor and !young) {
-                    if (owned_run_len != 0) {
-                        self.sweepDeadOwnedRun(owned_run_bytes, owned_run[0..owned_run_len], &cycle_reclaimed_cells, &cycle_reclaimed_bytes, &cycle_reclaimed_young_bytes);
-                        owned_run_len = 0;
-                    }
                     if (owned_enumeration) continue;
                     break;
                 }
@@ -2304,10 +2249,6 @@ pub fn Heap(comptime Binding: type) type {
                 const total = header_stride + headerPayloadSize(h);
                 if (minor and young) cycle_young_bytes += total;
                 if (headerFlagLoad(h, header_marked, .monotonic)) {
-                    if (owned_run_len != 0) {
-                        self.sweepDeadOwnedRun(owned_run_bytes, owned_run[0..owned_run_len], &cycle_reclaimed_cells, &cycle_reclaimed_bytes, &cycle_reclaimed_young_bytes);
-                        owned_run_len = 0;
-                    }
                     if (young) {
                         cycle_survived_cells += 1;
                         cycle_survived_bytes += total;
@@ -2324,18 +2265,6 @@ pub fn Heap(comptime Binding: type) type {
                         }
                     }
                     prev = h;
-                } else if (batch_owned_runs) {
-                    if (owned_run_len != 0 and owned_run_bytes != total) {
-                        self.sweepDeadOwnedRun(owned_run_bytes, owned_run[0..owned_run_len], &cycle_reclaimed_cells, &cycle_reclaimed_bytes, &cycle_reclaimed_young_bytes);
-                        owned_run_len = 0;
-                    }
-                    owned_run_bytes = total;
-                    owned_run[owned_run_len] = h;
-                    owned_run_len += 1;
-                    if (owned_run_len == owned_run.len) {
-                        self.sweepDeadOwnedRun(owned_run_bytes, &owned_run, &cycle_reclaimed_cells, &cycle_reclaimed_bytes, &cycle_reclaimed_young_bytes);
-                        owned_run_len = 0;
-                    }
                 } else {
                     // Stop owned classifiers from returning this slot before
                     // finalization clears side state or its header is reused.
@@ -2372,8 +2301,6 @@ pub fn Heap(comptime Binding: type) type {
                     }
                 }
             }
-            if (owned_run_len != 0)
-                self.sweepDeadOwnedRun(owned_run_bytes, owned_run[0..owned_run_len], &cycle_reclaimed_cells, &cycle_reclaimed_bytes, &cycle_reclaimed_young_bytes);
             if (@hasDecl(Binding, "freeCellStorageBatch") and release_batch_len != 0)
                 Binding.freeCellStorageBatch(self.ctx, release_batch_bytes, release_batch[0..release_batch_len]);
 
@@ -2929,9 +2856,6 @@ const OwnedIterationTestRT = struct {
     published: [16]?*anyopaque = @splat(null),
     finalized: [16]u32 = @splat(0),
     finalized_len: usize = 0,
-    unpublish_batch_calls: usize = 0,
-    largest_unpublish_batch: usize = 0,
-    finalizer_saw_published: bool = false,
 
     pub const Iterator = struct {
         rt: *OwnedIterationTestRT,
@@ -2978,11 +2902,6 @@ const OwnedIterationTestRT = struct {
         }
         unreachable;
     }
-    pub fn unpublishCellAllocationBatch(self: *OwnedIterationTestRT, _: usize, allocations: []*anyopaque) void {
-        self.unpublish_batch_calls += 1;
-        self.largest_unpublish_batch = @max(self.largest_unpublish_batch, allocations.len);
-        for (allocations) |allocation| self.unpublishCellAllocation(allocation, 0);
-    }
     pub fn traceRoots(self: *OwnedIterationTestRT, v: anytype) void {
         for (self.roots) |root| v.mark(root);
     }
@@ -2996,8 +2915,6 @@ const OwnedIterationTestRT = struct {
     }
     pub fn finalize(self: *OwnedIterationTestRT, cell: *anyopaque, _: Kind) void {
         const node: *Node = @ptrCast(@alignCast(cell));
-        const allocation: *anyopaque = @ptrFromInt(@intFromPtr(cell) - Heap(OwnedIterationTestRT).header_stride);
-        if (self.ownsCellAllocation(allocation)) self.finalizer_saw_published = true;
         self.finalized[self.finalized_len] = node.id;
         self.finalized_len += 1;
     }
@@ -4061,17 +3978,11 @@ test "owned cell iteration replaces intrusive publication across minor and full 
     try std.testing.expectEqual(@as(?*anyopaque, null), old.weak);
     try std.testing.expectEqual(@as(usize, 1), rt.finalized_len);
     try std.testing.expectEqual(@as(u32, 3), rt.finalized[0]);
-    try std.testing.expectEqual(@as(usize, 1), rt.unpublish_batch_calls);
-    try std.testing.expectEqual(@as(usize, 1), rt.largest_unpublish_batch);
-    try std.testing.expect(!rt.finalizer_saw_published);
 
     rt.roots = .{ null, null };
     heap.collect();
     try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
     for (rt.published) |allocation| try std.testing.expectEqual(@as(?*anyopaque, null), allocation);
-    try std.testing.expectEqual(@as(usize, 2), rt.unpublish_batch_calls);
-    try std.testing.expectEqual(@as(usize, 2), rt.largest_unpublish_batch);
-    try std.testing.expect(!rt.finalizer_saw_published);
 
     const teardown = try heap.create(OwnedIterationTestRT.Node, .node);
     teardown.* = .{ .id = 4 };
