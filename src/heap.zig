@@ -232,13 +232,14 @@ pub fn Heap(comptime Binding: type) type {
         const publication_shard_count = if (has_owned_cell_iterator) 64 else 0;
 
         /// One fixed 32-byte header on 64-bit targets: stable identity, the
-        /// all-cells link, checked payload size, kind/age, and four independently
+        /// all-cells link, checked payload size, kind/age, and five independently
         /// updated concurrent state bits packed into one atomic byte.
         const header_magic: u64 = 0x7a67_6763_5f68_6561;
         const header_marked: u8 = 1 << 0;
         const header_young: u8 = 1 << 1;
         const header_remembered_owner: u8 = 1 << 2;
         const header_remembered_target: u8 = 1 << 3;
+        const header_minor_survivor: u8 = 1 << 4;
         pub const Header = struct {
             magic: u64,
             stable_id: StableCellId,
@@ -413,9 +414,17 @@ pub fn Heap(comptime Binding: type) type {
         total_minor_reclaimed_bytes: usize = 0,
         total_minor_survived_bytes: usize = 0,
         total_minor_promoted_bytes: usize = 0,
+        moving_minor_collections: usize = 0,
+        last_minor_moved_cells: usize = 0,
+        last_minor_moved_bytes: usize = 0,
+        total_minor_moved_cells: usize = 0,
+        total_minor_moved_bytes: usize = 0,
+        minor_move_failures: usize = 0,
         nursery_threshold_bytes: usize = default_nursery_threshold_bytes,
         tenuring_age: u8 = default_tenuring_age,
         nursery_enabled: bool = false,
+        moving_nursery_enabled: bool = false,
+        moving_minor_cycle: bool = false,
         collection_kind: CollectionKind = .full,
         remembered_owners: std.ArrayListUnmanaged(*Header) = .empty,
         remembered_targets: std.ArrayListUnmanaged(*Header) = .empty,
@@ -651,7 +660,7 @@ pub fn Heap(comptime Binding: type) type {
             self.concurrent_marker_metadata = enabled;
         }
 
-        /// Enable the non-moving nursery. New cells start at age zero; a minor
+        /// Enable the nursery. New cells start at age zero; a minor
         /// collection reclaims unreachable young cells, advances live survivors,
         /// and tenures cells that reach `tenuring_age`. Existing cells stay old,
         /// so enabling this after heap initialization is safe. Disabling with a
@@ -668,6 +677,24 @@ pub fn Heap(comptime Binding: type) type {
                 self.tenureYoungPrefix();
             if (!enabled) self.clearRemembered();
             self.nursery_enabled = enabled;
+        }
+
+        /// Move every live young survivor after weak processing and sweep.
+        /// Embedders must still open their relocation/root-rewrite token at the
+        /// stop window; enabling the policy alone never makes an unsafe stack
+        /// movable.
+        pub fn setMovingNurseryEnabled(self: *Self, enabled: bool) void {
+            if (comptime !supports_relocation) {
+                std.debug.assert(!enabled);
+                self.moving_nursery_enabled = false;
+                return;
+            }
+            std.debug.assert(!self.marking.load(.acquire));
+            self.moving_nursery_enabled = enabled;
+        }
+
+        pub fn movingNurseryEnabled(self: *const Self) bool {
+            return self.moving_nursery_enabled;
         }
 
         /// Select how many successful minor collections a young cell must
@@ -707,6 +734,12 @@ pub fn Heap(comptime Binding: type) type {
             total_minor_reclaimed_bytes: usize,
             total_minor_survived_bytes: usize,
             total_minor_promoted_bytes: usize,
+            moving_minor_collections: usize,
+            last_minor_moved_cells: usize,
+            last_minor_moved_bytes: usize,
+            total_minor_moved_cells: usize,
+            total_minor_moved_bytes: usize,
+            minor_move_failures: usize,
         };
 
         pub const CompactionStatus = enum {
@@ -748,6 +781,12 @@ pub fn Heap(comptime Binding: type) type {
                 .total_minor_reclaimed_bytes = self.total_minor_reclaimed_bytes,
                 .total_minor_survived_bytes = self.total_minor_survived_bytes,
                 .total_minor_promoted_bytes = self.total_minor_promoted_bytes,
+                .moving_minor_collections = self.moving_minor_collections,
+                .last_minor_moved_cells = self.last_minor_moved_cells,
+                .last_minor_moved_bytes = self.last_minor_moved_bytes,
+                .total_minor_moved_cells = self.total_minor_moved_cells,
+                .total_minor_moved_bytes = self.total_minor_moved_bytes,
+                .minor_move_failures = self.minor_move_failures,
             };
         }
 
@@ -1614,7 +1653,16 @@ pub fn Heap(comptime Binding: type) type {
             return self.compactLiveCells();
         }
 
+        const RelocationSelection = enum {
+            binding,
+            minor_survivor,
+        };
+
         fn compactLiveCells(self: *Self) CompactionResult {
+            return self.compactSelectedCells(.binding);
+        }
+
+        fn compactSelectedCells(self: *Self, selection: RelocationSelection) CompactionResult {
             if (comptime !supports_relocation) return .{ .status = .unsupported };
             std.debug.assert(!self.marking.load(.acquire));
             std.debug.assert(!self.concurrent.load(.acquire));
@@ -1639,7 +1687,15 @@ pub fn Heap(comptime Binding: type) type {
             var cells = self.cellIterator();
             while (cells.next()) |old_header| {
                 const old_payload = payloadOf(old_header);
-                if (!Binding.canRelocate(self.ctx, old_payload, old_header.kind)) continue;
+                const selected = switch (selection) {
+                    .binding => Binding.canRelocate(self.ctx, old_payload, old_header.kind),
+                    .minor_survivor => headerFlagLoad(old_header, header_minor_survivor, .monotonic) and
+                        (if (@hasDecl(Binding, "canRelocateYoung"))
+                            Binding.canRelocateYoung(self.ctx, old_payload, old_header.kind)
+                        else
+                            Binding.canRelocate(self.ctx, old_payload, old_header.kind)),
+                };
+                if (!selected) continue;
                 const total = header_stride + headerPayloadSize(old_header);
                 const new_header = self.reserveRelocationCell(total) orelse {
                     for (records.items) |record|
@@ -1680,6 +1736,7 @@ pub fn Heap(comptime Binding: type) type {
                 const current_payload = visitor.resolve(payloadOf(old_header));
                 Binding.relocateCell(self.ctx, current_payload, old_header.kind, &visitor);
             }
+            if (selection == .minor_survivor) self.rewriteRememberedAfterRelocation(&visitor);
             for (records.items) |*record| record.state = .rewritten;
 
             // Repair the generic intrusive list before freeing any old header.
@@ -1708,6 +1765,8 @@ pub fn Heap(comptime Binding: type) type {
                 // and the generic list/index all point at the destination.
                 old_header.magic = 0;
                 self.commitRelocationCell(old_header, new_header, total);
+                if (selection == .minor_survivor)
+                    headerFlagStore(new_header, header_minor_survivor, false, .release);
             }
             if (comptime relocation_verify_hooks == 2) {
                 // Forwarding records are still live, while the binding's
@@ -1729,19 +1788,59 @@ pub fn Heap(comptime Binding: type) type {
             };
         }
 
+        fn rewriteRememberedAfterRelocation(self: *Self, visitor: anytype) void {
+            self.lockRemember();
+            defer self.unlockRemember();
+
+            for (self.remembered_owners.items) |*header| {
+                if (header.*.magic != header_magic) continue;
+                header.* = headerOf(visitor.resolve(payloadOf(header.*)));
+            }
+
+            var retained_targets: usize = 0;
+            for (self.remembered_targets.items) |header| {
+                if (header.magic != header_magic) continue;
+                const current = headerOf(visitor.resolve(payloadOf(header)));
+                if (headerFlagLoad(current, header_young, .monotonic)) {
+                    self.remembered_targets.items[retained_targets] = current;
+                    retained_targets += 1;
+                } else {
+                    headerFlagStore(current, header_remembered_target, false, .release);
+                }
+            }
+            self.remembered_targets.items.len = retained_targets;
+        }
+
+        pub fn collectYoung(self: *Self) void {
+            _ = self.collectYoungInternal(false);
+        }
+
+        /// Run the same exact minor trace/weak/sweep contract, then relocate
+        /// every survivor (including cells promoted by this cycle). Destination
+        /// reservation completes before roots or graph bytes change.
+        pub fn collectYoungAndCompact(self: *Self) CompactionResult {
+            if (!self.moving_nursery_enabled) return .{ .status = .unsupported };
+            return self.collectYoungInternal(true);
+        }
+
         /// Run a stop-the-world nursery cycle. Old roots are not recursively
         /// rescanned; dirty old containers and conservative child-only barrier
         /// targets supply the old-to-young frontier. Live young cells advance
         /// one age and are tenured only when they reach `tenuring_age`.
-        pub fn collectYoung(self: *Self) void {
+        fn collectYoungInternal(self: *Self, moving: bool) CompactionResult {
             std.debug.assert(!self.marking.load(.acquire));
             std.debug.assert(!self.concurrent.load(.acquire));
-            if (!self.nursery_enabled) return;
-            if (self.young_bytes + self.publicationTotals().young_bytes == 0) return;
+            if (!self.nursery_enabled) return .{ .status = .unsupported };
+            if (self.young_bytes + self.publicationTotals().young_bytes == 0)
+                return .{ .status = .no_candidates };
             if (self.nursery_force_full.load(.acquire)) {
                 self.collect();
-                return;
+                return .{ .status = .unsupported };
             }
+            self.moving_minor_cycle = moving;
+            defer self.moving_minor_cycle = false;
+            self.last_minor_moved_cells = 0;
+            self.last_minor_moved_bytes = 0;
 
             self.publishCollectionPhase(.minor_prepare_begin);
             if (self.parallel) self.lockAlloc();
@@ -1813,11 +1912,36 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.publishCollectionPhase(.minor_sweep_begin);
             self.sweepPhase(&v);
+            const relocation = if (moving)
+                self.compactSelectedCells(.minor_survivor)
+            else
+                CompactionResult{ .status = .unsupported };
+            if (moving) {
+                self.clearMinorSurvivorFlags();
+                switch (relocation.status) {
+                    .compacted => {
+                        self.moving_minor_collections += 1;
+                        self.last_minor_moved_cells = relocation.moved_cells;
+                        self.last_minor_moved_bytes = relocation.moved_bytes;
+                        self.total_minor_moved_cells +|= relocation.moved_cells;
+                        self.total_minor_moved_bytes +|= relocation.moved_bytes;
+                    },
+                    .no_candidates => self.moving_minor_collections += 1,
+                    .unsupported, .out_of_memory => self.minor_move_failures += 1,
+                }
+            }
             self.publishCollectionPhase(.minor_sweep_end);
             self.collection_kind = .full;
             self.reopenShardedPublication();
             self.runAfterSweep();
             self.publishCollectionPhase(.minor_post_sweep_end);
+            return relocation;
+        }
+
+        fn clearMinorSurvivorFlags(self: *Self) void {
+            var cells = self.cellIterator();
+            while (cells.next()) |header|
+                headerFlagStore(header, header_minor_survivor, false, .monotonic);
         }
 
         // ---- Concurrent marking (M3) -------------------------------------
@@ -2250,12 +2374,15 @@ pub fn Heap(comptime Binding: type) type {
                 if (minor and young) cycle_young_bytes += total;
                 if (headerFlagLoad(h, header_marked, .monotonic)) {
                     if (young) {
+                        if (minor and self.moving_minor_cycle)
+                            headerFlagStore(h, header_minor_survivor, true, .release);
                         cycle_survived_cells += 1;
                         cycle_survived_bytes += total;
                         const next_age = h.age + 1;
                         if (!minor or next_age >= self.tenuring_age) {
                             headerFlagStore(h, header_young, false, .release);
                             h.age = tenured_age;
+                            if (minor) self.rememberOwner(h);
                             cycle_promoted_cells += 1;
                             cycle_promoted_bytes += total;
                         } else {
@@ -2574,9 +2701,17 @@ const TestRT = struct {
         };
     }
 
+    pub fn canRelocateYoung(_: *TestRT, _: *anyopaque, _: Kind) bool {
+        return true;
+    }
+
     pub fn relocateRoots(self: *TestRT, v: anytype) void {
         for (self.roots.items) |*root|
             root.* = @ptrCast(@alignCast(v.resolve(root.*)));
+        if (self.atomic_weak_root) |slot| {
+            if (slot.load(.acquire)) |target|
+                slot.store(v.resolve(target), .release);
+        }
     }
 
     pub fn relocateCell(_: *TestRT, cell: *anyopaque, kind: Kind, v: anytype) void {
@@ -3482,6 +3617,124 @@ test "multi-age nursery retains survivors and promotes at the configured age" {
         stats.total_minor_survived_bytes + stats.total_minor_reclaimed_bytes,
     );
     try std.testing.expectEqual(H.tenured_age, H.headerOf(survivor).age);
+}
+
+test "moving nursery preserves identities roots edges weak state and age promotion" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    const H = Heap(TestRT);
+    var heap = H.init(a, &rt);
+    defer heap.deinit();
+    heap.setNurseryTenuringAge(3);
+    heap.setNurseryEnabled(true);
+    heap.setMovingNurseryEnabled(true);
+
+    const first_parent = try heap.create(TestRT.Node, .node);
+    first_parent.* = .{ .id = 1 };
+    try rt.roots.append(a, first_parent);
+    const parent_id = heap.cellMetadata(first_parent).?.id;
+
+    const first = heap.collectYoungAndCompact();
+    try std.testing.expectEqual(H.CompactionStatus.compacted, first.status);
+    const second_parent = rt.roots.items[0];
+    try std.testing.expect(second_parent != first_parent);
+    try std.testing.expectEqual(parent_id, heap.cellMetadata(second_parent).?.id);
+    try std.testing.expectEqual(@as(u8, 1), H.headerOf(second_parent).age);
+
+    // Create the child one age behind its parent. The parent promotes first,
+    // so its remembered-owner card must persist while the child moves through
+    // one final young cycle.
+    const first_child = try heap.create(TestRT.Node, .node);
+    first_child.* = .{ .id = 2 };
+    second_parent.strong = first_child;
+    second_parent.weak = first_child;
+    heap.writeBarrierFromManaged(second_parent, first_child);
+    heap.writeBarrierWeak(second_parent);
+    try rt.roots.append(a, first_child);
+    const child_id = heap.cellMetadata(first_child).?.id;
+    var weak_root = std.atomic.Value(?*anyopaque).init(@ptrCast(first_child));
+    rt.atomic_weak_root = &weak_root;
+
+    const second = heap.collectYoungAndCompact();
+    try std.testing.expectEqual(H.CompactionStatus.compacted, second.status);
+    const third_parent = rt.roots.items[0];
+    const second_child = rt.roots.items[1];
+    try std.testing.expect(third_parent != second_parent);
+    try std.testing.expect(second_child != first_child);
+    try std.testing.expectEqual(second_child, third_parent.strong.?);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(second_child)), third_parent.weak);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(second_child)), weak_root.load(.acquire));
+    try std.testing.expectEqual(parent_id, heap.cellMetadata(third_parent).?.id);
+    try std.testing.expectEqual(child_id, heap.cellMetadata(second_child).?.id);
+    try std.testing.expectEqual(@as(u8, 2), H.headerOf(third_parent).age);
+    try std.testing.expectEqual(@as(u8, 1), H.headerOf(second_child).age);
+
+    // Drop the child's direct strong root. The promoted parent is now its only
+    // strong owner, exercising the promotion-created remembered card.
+    _ = rt.roots.pop();
+    const third = heap.collectYoungAndCompact();
+    try std.testing.expectEqual(H.CompactionStatus.compacted, third.status);
+    const promoted_parent = rt.roots.items[0];
+    const third_child = promoted_parent.strong.?;
+    try std.testing.expect(promoted_parent != third_parent);
+    try std.testing.expect(third_child != second_child);
+    try std.testing.expectEqual(H.tenured_age, H.headerOf(promoted_parent).age);
+    try std.testing.expectEqual(@as(u8, 2), H.headerOf(third_child).age);
+    try std.testing.expectEqual(child_id, heap.cellMetadata(third_child).?.id);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(third_child)), promoted_parent.weak);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(third_child)), weak_root.load(.acquire));
+
+    const fourth = heap.collectYoungAndCompact();
+    try std.testing.expectEqual(H.CompactionStatus.compacted, fourth.status);
+    const promoted_child = rt.roots.items[0].strong.?;
+    try std.testing.expect(promoted_child != third_child);
+    try std.testing.expectEqual(H.tenured_age, H.headerOf(promoted_child).age);
+    try std.testing.expectEqual(@as(usize, 0), heap.accounting().young_cells);
+    try std.testing.expectEqual(@as(usize, 4), heap.accounting().moving_minor_collections);
+    try std.testing.expectEqual(@as(usize, 6), heap.accounting().total_minor_moved_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.accounting().minor_move_failures);
+    try std.testing.expectEqual(@as(usize, 4), rt.relocation_root_verifications);
+    try std.testing.expectEqual(@as(usize, 6), rt.relocation_commits);
+}
+
+test "moving nursery relocation reservation failure leaves graph bytes untouched" {
+    const a = std.testing.allocator;
+    for (0..2) |fail_at| {
+        var rt = TestRT{ .relocation_reserve_limit = fail_at };
+        defer rt.roots.deinit(a);
+        defer rt.finalized.deinit(a);
+        var heap = Heap(TestRT).init(a, &rt);
+        defer heap.deinit();
+        heap.setNurseryTenuringAge(3);
+        heap.setNurseryEnabled(true);
+        heap.setMovingNurseryEnabled(true);
+
+        const first = try heap.create(TestRT.Node, .node);
+        first.* = .{ .id = 10 };
+        const second = try heap.create(TestRT.Node, .node);
+        second.* = .{ .id = 11 };
+        first.strong = second;
+        second.strong = first;
+        try rt.roots.append(a, first);
+        const first_id = heap.cellMetadata(first).?.id;
+        const second_id = heap.cellMetadata(second).?.id;
+
+        const result = heap.collectYoungAndCompact();
+        try std.testing.expectEqual(Heap(TestRT).CompactionStatus.out_of_memory, result.status);
+        try std.testing.expectEqual(first, rt.roots.items[0]);
+        try std.testing.expectEqual(second, first.strong.?);
+        try std.testing.expectEqual(first, second.strong.?);
+        try std.testing.expectEqual(first_id, heap.cellMetadata(first).?.id);
+        try std.testing.expectEqual(second_id, heap.cellMetadata(second).?.id);
+        try std.testing.expectEqual(fail_at, rt.relocation_reserve_calls);
+        try std.testing.expectEqual(fail_at, rt.relocation_rollbacks);
+        try std.testing.expectEqual(@as(usize, 0), rt.relocation_commits);
+        try std.testing.expectEqual(@as(usize, 1), heap.accounting().minor_move_failures);
+        try std.testing.expectEqual(@as(usize, 0), heap.accounting().last_minor_moved_cells);
+    }
 }
 
 test "multi-age owner and weak cards persist across minor collections" {
