@@ -235,8 +235,12 @@ pub fn Heap(comptime Binding: type) type {
             @typeInfo(@TypeOf(Binding.ownedCellIterator)).@"fn".return_type.?
         else
             void;
-        pub const min_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
-        pub const default_nursery_threshold_bytes: usize = 4 * 1024 * 1024;
+        // Keep the default young working set inside the shared cache budget of
+        // several independent collectors. Embedders can still raise the
+        // threshold, while adaptive decay returns sparse survivors to this
+        // cache-local floor.
+        pub const min_nursery_threshold_bytes: usize = 2 * 1024 * 1024;
+        pub const default_nursery_threshold_bytes: usize = 2 * 1024 * 1024;
         pub const default_tenuring_age: u8 = 1;
         const tenured_age: u8 = std.math.maxInt(u8);
         const min_retained_scratch_entries: usize = 4096;
@@ -3934,9 +3938,23 @@ test "nursery threshold growth is capped by observed young batch" {
         heap.nextNurseryThreshold(12 * 1024 * 1024, 8 * 1024 * 1024),
     );
     try std.testing.expectEqual(
-        Heap(TestRT).min_nursery_threshold_bytes,
+        @as(usize, 4 * 1024 * 1024),
         heap.nextNurseryThreshold(64 * 1024, 64 * 1024),
     );
+}
+
+test "nursery defaults to its cache-local adaptive floor" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(TestRT).init(a, &rt);
+    defer heap.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), Heap(TestRT).min_nursery_threshold_bytes);
+    try std.testing.expectEqual(Heap(TestRT).min_nursery_threshold_bytes, Heap(TestRT).default_nursery_threshold_bytes);
+    try std.testing.expectEqual(Heap(TestRT).default_nursery_threshold_bytes, heap.nursery_threshold_bytes);
 }
 
 test "collector scratch frees oversized empty buffers after spike" {
