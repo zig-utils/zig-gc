@@ -81,23 +81,34 @@ pub const StableCellId = enum(u64) {
 
     pub fn init(raw: u64) StableCellId {
         std.debug.assert(raw != 0);
-        return @enumFromInt(raw);
+        return @fromBackingInt(@intCast(raw));
     }
 };
 
+const stable_cell_id_block_size: u64 = 4096;
 var next_stable_cell_id: std.atomic.Value(u64) = .init(1);
+threadlocal var stable_cell_id_next: u64 = 0;
+threadlocal var stable_cell_id_end: u64 = 0;
 
 fn allocateStableCellId() StableCellId {
-    var current = next_stable_cell_id.load(.monotonic);
-    while (true) {
-        if (current == 0 or current == std.math.maxInt(u64))
-            @panic("zig-gc stable cell identity exhausted");
-        if (next_stable_cell_id.cmpxchgWeak(current, current + 1, .monotonic, .monotonic)) |observed| {
-            current = observed;
-            continue;
+    if (stable_cell_id_next == stable_cell_id_end) {
+        var first = next_stable_cell_id.load(.monotonic);
+        while (true) {
+            if (first == 0 or first == std.math.maxInt(u64))
+                @panic("zig-gc stable cell identity exhausted");
+            const end = first + @min(stable_cell_id_block_size, std.math.maxInt(u64) - first);
+            if (next_stable_cell_id.cmpxchgWeak(first, end, .monotonic, .monotonic)) |observed| {
+                first = observed;
+                continue;
+            }
+            stable_cell_id_next = first;
+            stable_cell_id_end = end;
+            break;
         }
-        return .init(current);
     }
+    const id = stable_cell_id_next;
+    stable_cell_id_next += 1;
+    return .init(id);
 }
 
 pub const RelocationState = enum {
@@ -2615,7 +2626,7 @@ test "relocation visitor resolves moved cells and preserves pinned cells" {
     try std.testing.expectEqual(@as(*anyopaque, &pinned_string), visitor.resolve(&pinned_string));
     try std.testing.expect(visitor.moved(&old_object));
     try std.testing.expect(!visitor.moved(&pinned_string));
-    try std.testing.expectEqual(@as(u64, 17), @intFromEnum(visitor.stableId(&old_object).?));
+    try std.testing.expectEqual(@as(u64, 17), @backingInt(visitor.stableId(&old_object).?));
     try std.testing.expectEqual(@as(?StableCellId, null), visitor.stableId(&pinned_string));
 }
 
@@ -3125,7 +3136,7 @@ test "stable cell metadata is process-unique, batched, and never recycled" {
     ids[1] = second.cellMetadata(other_heap).?.id;
     for (batch, 0..) |node, i| ids[i + 2] = first.cellMetadata(node).?.id;
     for (ids, 0..) |id, i| {
-        try std.testing.expect(@intFromEnum(id) != 0);
+        try std.testing.expect(@backingInt(id) != 0);
         for (ids[0..i]) |prior| try std.testing.expect(id != prior);
     }
     try std.testing.expectEqual(@sizeOf(N), first.cellMetadata(rooted).?.size);
@@ -3143,6 +3154,33 @@ test "stable cell metadata is process-unique, batched, and never recycled" {
     const replacement = try first.create(N, .node);
     replacement.* = .{ .id = 21 };
     try std.testing.expect(first.cellMetadata(replacement).?.id != doomed_id);
+}
+
+test "stable cell identity blocks stay unique across allocator threads" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const thread_count = 8;
+    const ids_per_thread: usize = stable_cell_id_block_size + 17;
+    const ids = try std.testing.allocator.alloc(u64, thread_count * ids_per_thread);
+    defer std.testing.allocator.free(ids);
+
+    const Runner = struct {
+        fn run(out: []u64) void {
+            for (out) |*id| id.* = @backingInt(allocateStableCellId());
+        }
+    };
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| {
+        const start = i * ids_per_thread;
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{ids[start..][0..ids_per_thread]});
+    }
+    for (&threads) |*thread| thread.join();
+
+    std.mem.sort(u64, ids, {}, std.sort.asc(u64));
+    try std.testing.expect(ids[0] != 0);
+    for (ids[1..], ids[0 .. ids.len - 1]) |id, prior| {
+        try std.testing.expect(id != prior);
+    }
 }
 
 test "64-bit header stays 32 bytes and packed flags transition independently" {
