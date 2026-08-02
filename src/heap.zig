@@ -532,6 +532,52 @@ pub fn Heap(comptime Binding: type) type {
                 const p = cell orelse return;
                 const h = Self.headerOf(p);
                 if (h.magic != header_magic) std.debug.panic("GC mark of non-GC cell at 0x{x}", .{@intFromPtr(p)});
+                v.markHeader(h);
+            }
+
+            /// Labeled edge variants let bindings retain precise provenance in
+            /// corruption diagnostics without adding work to successful marks.
+            pub fn markProperty(v: *Visitor, name: []const u8, cell: ?*anyopaque) void {
+                const p = cell orelse return;
+                const h = Self.headerOf(p);
+                if (h.magic != header_magic) std.debug.panic(
+                    "GC mark of non-GC cell at 0x{x} from property {s}",
+                    .{ @intFromPtr(p), name },
+                );
+                v.markHeader(h);
+            }
+
+            pub fn markIndex(v: *Visitor, index: usize, cell: ?*anyopaque) void {
+                const p = cell orelse return;
+                const h = Self.headerOf(p);
+                if (h.magic != header_magic) std.debug.panic(
+                    "GC mark of non-GC cell at 0x{x} from index {d}",
+                    .{ @intFromPtr(p), index },
+                );
+                v.markHeader(h);
+            }
+
+            pub fn markVariable(v: *Visitor, name: []const u8, cell: ?*anyopaque) void {
+                const p = cell orelse return;
+                const h = Self.headerOf(p);
+                if (h.magic != header_magic) std.debug.panic(
+                    "GC mark of non-GC cell at 0x{x} from variable {s}",
+                    .{ @intFromPtr(p), name },
+                );
+                v.markHeader(h);
+            }
+
+            pub fn markInternal(v: *Visitor, name: []const u8, cell: ?*anyopaque) void {
+                const p = cell orelse return;
+                const h = Self.headerOf(p);
+                if (h.magic != header_magic) std.debug.panic(
+                    "GC mark of non-GC cell at 0x{x} from internal slot {s}",
+                    .{ @intFromPtr(p), name },
+                );
+                v.markHeader(h);
+            }
+
+            fn markHeader(v: *Visitor, h: *Header) void {
                 if (v.heap.collection_kind == .minor and !headerFlagLoad(h, header_young, .monotonic)) return;
                 if (!v.heap.claimMark(h)) return; // already grey/black
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
@@ -1440,7 +1486,18 @@ pub fn Heap(comptime Binding: type) type {
         fn rememberStrongStore(self: *Self, owner: ?*anyopaque, cell: ?*anyopaque) void {
             if (!self.nursery_enabled) return;
             const child_ptr = cell orelse return;
-            const child = self.headerForPayload(child_ptr) orelse return;
+            const child = self.headerForPayload(child_ptr) orelse {
+                if (builtin.mode == .Debug) {
+                    if (self.bindingClassifyConservativeInterior(@intFromPtr(child_ptr))) |ownership| switch (ownership) {
+                        .outside => {},
+                        .owned_empty, .allocation => std.debug.panic(
+                            "GC write barrier received stale owned cell at 0x{x}",
+                            .{@intFromPtr(child_ptr)},
+                        ),
+                    };
+                }
+                return;
+            };
             if (!headerFlagLoad(child, header_young, .acquire)) return;
             if (owner) |owner_ptr| {
                 if (self.headerForPayload(owner_ptr)) |parent| {
