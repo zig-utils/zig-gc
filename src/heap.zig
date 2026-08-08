@@ -44,6 +44,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Zig 0.17 renamed the optimization enum tags from title case to lowercase
+// (`.Debug` -> `.debug`). Comparing on the tag name keeps this source
+// compatible across that boundary instead of picking one side of it —
+// the same approach zig-js takes for the same rename.
+const debug_build = std.ascii.eqlIgnoreCase(@tagName(builtin.mode), "debug");
+
 /// Semantic collection boundaries for opt-in embedder profiling. The generic
 /// heap deliberately owns no clock or counters; bindings that omit the hook pay
 /// no runtime cost. `prepare_begin` is emitted only after a collection is known
@@ -1487,7 +1493,7 @@ pub fn Heap(comptime Binding: type) type {
             if (!self.nursery_enabled) return;
             const child_ptr = cell orelse return;
             const child = self.headerForPayload(child_ptr) orelse {
-                if (builtin.mode == .debug) {
+                if (debug_build) {
                     if (self.bindingClassifyConservativeInterior(@intFromPtr(child_ptr))) |ownership| switch (ownership) {
                         .outside => {},
                         .owned_empty, .allocation => std.debug.panic(
