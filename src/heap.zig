@@ -1487,7 +1487,7 @@ pub fn Heap(comptime Binding: type) type {
             if (!self.nursery_enabled) return;
             const child_ptr = cell orelse return;
             const child = self.headerForPayload(child_ptr) orelse {
-                if (builtin.mode == .Debug) {
+                if (builtin.mode == .debug) {
                     if (self.bindingClassifyConservativeInterior(@intFromPtr(child_ptr))) |ownership| switch (ownership) {
                         .outside => {},
                         .owned_empty, .allocation => std.debug.panic(
