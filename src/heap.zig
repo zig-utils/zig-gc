@@ -53,18 +53,21 @@ const debug_build = std.ascii.eqlIgnoreCase(@tagName(builtin.mode), "debug");
 /// Semantic collection boundaries for opt-in embedder profiling. The generic
 /// heap deliberately owns no clock or counters; bindings that omit the hook pay
 /// no runtime cost. `prepare_begin` is emitted only after a collection is known
-/// to run, and `post_sweep_end` follows the optional `afterSweep` hook.
+/// to run, `post_sweep_end` follows the optional `afterSweep` hook, and
+/// `abort` closes an attempt that deliberately skipped weak clearing and sweep.
 pub const CollectionPhaseBoundary = enum {
     full_prepare_begin,
     full_trace_begin,
     full_sweep_begin,
     full_sweep_end,
     full_post_sweep_end,
+    full_abort,
     minor_prepare_begin,
     minor_trace_begin,
     minor_sweep_begin,
     minor_sweep_end,
     minor_post_sweep_end,
+    minor_abort,
 };
 
 /// Optional binding result for conservative interior-address classification.
@@ -437,6 +440,10 @@ pub fn Heap(comptime Binding: type) type {
         total_minor_moved_cells: usize = 0,
         total_minor_moved_bytes: usize = 0,
         minor_move_failures: usize = 0,
+        /// Number of mark attempts abandoned before sweep, including incomplete
+        /// work publication and parallel finishes that could not stabilize. An
+        /// aborted attempt frees no cells and retries from a freshly whitened graph.
+        aborted_collections: usize = 0,
         nursery_threshold_bytes: usize = default_nursery_threshold_bytes,
         tenuring_age: u8 = default_tenuring_age,
         nursery_enabled: bool = false,
@@ -460,6 +467,10 @@ pub fn Heap(comptime Binding: type) type {
         /// paths with no GIL. The load is `.acquire` / store `.release`, which
         /// on x86_64/arm64 is a plain `mov` — the M1/M2 fast path is unchanged.
         marking: std.atomic.Value(bool) = .init(false),
+        /// Sticky for one mark attempt. Mark claims precede worklist publication,
+        /// so any append failure makes the current closure incomplete; every
+        /// sweep boundary checks this flag and aborts without freeing cells.
+        mark_work_failed: std.atomic.Value(bool) = .init(false),
         /// True during a *concurrent* mark (M3): the marker runs on its own
         /// thread while mutators keep executing. The mark-claim then uses an
         /// atomic compare-and-set on the cell's mark bit (so marker and mutator
@@ -525,9 +536,9 @@ pub fn Heap(comptime Binding: type) type {
 
         pub const Visitor = struct {
             heap: *Self,
-            /// Set if the mark stack couldn't grow mid-collection. A real M2/M3
-            /// collector pre-sizes or falls back to a conservative re-scan; M1
-            /// surfaces it so the embedder can grow the reserve and retry.
+            /// Local diagnostic mirror of a collector scratch failure. The
+            /// Heap's sticky attempt flag is authoritative: every mark-work
+            /// failure aborts before weak clearing or sweep.
             oom: bool = false,
 
             /// Mark a strong reference. Null-safe and idempotent (tri-color:
@@ -588,6 +599,7 @@ pub fn Heap(comptime Binding: type) type {
                 if (!v.heap.claimMark(h)) return; // already grey/black
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
+                    v.heap.noteMarkWorkFailure();
                 };
             }
 
@@ -636,6 +648,7 @@ pub fn Heap(comptime Binding: type) type {
                 if (!v.heap.claimMark(h)) return;
                 v.heap.mark_stack.append(v.heap.aux, h) catch {
                     v.oom = true;
+                    v.heap.noteMarkWorkFailure();
                 };
             }
 
@@ -671,6 +684,7 @@ pub fn Heap(comptime Binding: type) type {
             pub fn deferToFinish(v: *Visitor, cell: *anyopaque) void {
                 v.heap.deferred_trace.append(v.heap.aux, Self.headerOf(cell)) catch {
                     v.oom = true;
+                    v.heap.noteMarkWorkFailure();
                 };
             }
 
@@ -681,6 +695,7 @@ pub fn Heap(comptime Binding: type) type {
                 defer v.heap.unlockWeak();
                 v.heap.weak_slots.append(v.heap.aux, slot) catch {
                     v.oom = true;
+                    v.heap.noteMarkWorkFailure();
                 };
             }
 
@@ -692,6 +707,7 @@ pub fn Heap(comptime Binding: type) type {
                 defer v.heap.unlockWeak();
                 v.heap.weak_atomic_slots.append(v.heap.aux, slot) catch {
                     v.oom = true;
+                    v.heap.noteMarkWorkFailure();
                 };
             }
         };
@@ -803,6 +819,7 @@ pub fn Heap(comptime Binding: type) type {
             total_minor_moved_cells: usize,
             total_minor_moved_bytes: usize,
             minor_move_failures: usize,
+            aborted_collections: usize,
         };
 
         pub const CompactionStatus = enum {
@@ -850,6 +867,7 @@ pub fn Heap(comptime Binding: type) type {
                 .total_minor_moved_cells = self.total_minor_moved_cells,
                 .total_minor_moved_bytes = self.total_minor_moved_bytes,
                 .minor_move_failures = self.minor_move_failures,
+                .aborted_collections = self.aborted_collections,
             };
         }
 
@@ -1251,7 +1269,7 @@ pub fn Heap(comptime Binding: type) type {
                     // so the marker must not trace it concurrently. Defer it to
                     // `finishConcurrentMark` (world stopped, payload complete).
                     _ = @atomicRmw(usize, &self.marked_count, .Add, 1, .monotonic);
-                    self.born_concurrent.append(self.aux, h) catch {};
+                    self.born_concurrent.append(self.aux, h) catch self.noteMarkWorkFailure();
                 } else {
                     // A parallel mutator can observe a stale `marking=true`
                     // just after abort/finish cleared `concurrent`. The cell is
@@ -1259,7 +1277,7 @@ pub fn Heap(comptime Binding: type) type {
                     // it; do not touch the marker-private stack from this thread.
                     if (!self.parallel) {
                         self.marked_count += 1;
-                        self.mark_stack.append(self.aux, h) catch {};
+                        self.mark_stack.append(self.aux, h) catch self.noteMarkWorkFailure();
                     }
                 }
             }
@@ -1519,6 +1537,7 @@ pub fn Heap(comptime Binding: type) type {
             self.remembered_targets.append(self.aux, child) catch {
                 headerFlagStore(child, header_remembered_target, false, .release);
                 self.nursery_force_full.store(true, .release);
+                if (self.marking.load(.acquire)) self.noteMarkWorkFailure();
             };
             self.unlockRemember();
         }
@@ -1529,6 +1548,7 @@ pub fn Heap(comptime Binding: type) type {
             self.remembered_owners.append(self.aux, h) catch {
                 headerFlagStore(h, header_remembered_owner, false, .release);
                 self.nursery_force_full.store(true, .release);
+                if (self.marking.load(.acquire)) self.noteMarkWorkFailure();
             };
             self.unlockRemember();
         }
@@ -1550,7 +1570,7 @@ pub fn Heap(comptime Binding: type) type {
                 // while holding the hand-off lock so a stale mutator cannot
                 // append into `barrier_buf` after abort cleared it.
                 if (self.marking.load(.acquire) and self.concurrent.load(.acquire))
-                    self.barrier_buf.append(self.aux, h) catch {};
+                    self.barrier_buf.append(self.aux, h) catch self.noteMarkWorkFailure();
                 self.unlockBarrier();
             } else {
                 // In a parallel heap, mutators must never append to the
@@ -1559,8 +1579,36 @@ pub fn Heap(comptime Binding: type) type {
                 // `concurrent` has been cleared; the claim is harmless and the
                 // next cycle re-whitens every cell.
                 if (self.parallel) return;
-                self.mark_stack.append(self.aux, h) catch {};
+                self.mark_stack.append(self.aux, h) catch self.noteMarkWorkFailure();
             }
+        }
+
+        inline fn noteMarkWorkFailure(self: *Self) void {
+            self.mark_work_failed.store(true, .release);
+        }
+
+        fn appendMarkSlice(self: *Self, items: []const *Header) bool {
+            self.mark_stack.appendSlice(self.aux, items) catch {
+                self.noteMarkWorkFailure();
+                return false;
+            };
+            return true;
+        }
+
+        fn appendMarkHeader(self: *Self, h: *Header) bool {
+            self.mark_stack.append(self.aux, h) catch {
+                self.noteMarkWorkFailure();
+                return false;
+            };
+            return true;
+        }
+
+        inline fn beginMarkAttempt(self: *Self) void {
+            self.mark_work_failed.store(false, .release);
+        }
+
+        pub fn markWorkPublicationFailed(self: *const Self) bool {
+            return self.mark_work_failed.load(.acquire);
         }
 
         /// Atomically claim a white cell as grey (returns true once per cell).
@@ -1630,6 +1678,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Begin an incremental mark: whiten all cells and grey the roots. The
         /// mutator then runs between `markStep`s with the `writeBarrier` active.
         pub fn startMarking(self: *Self) void {
+            self.beginMarkAttempt();
             self.publishCollectionPhase(.full_prepare_begin);
             self.collection_kind = .full;
             _ = self.closeAndFoldPublicationShards();
@@ -1647,7 +1696,7 @@ pub fn Heap(comptime Binding: type) type {
             // path. Reserved before roots are traced (still at the safepoint) so
             // even the initial root push is covered. Cells born during the cycle
             // are folded in at the world-stopped finish, where a grow is safe.
-            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
             self.weak_atomic_slots.clearRetainingCapacity();
@@ -1657,8 +1706,8 @@ pub fn Heap(comptime Binding: type) type {
             // reallocates from `aux` mid-mark and reuses a page concurrently with
             // a mutator's object-backing write (the same allocator-reuse TSan
             // class the mark-stack reservation avoids).
-            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
-            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -1698,9 +1747,16 @@ pub fn Heap(comptime Binding: type) type {
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
+            if (self.markWorkPublicationFailed()) {
+                self.abortMarkAttempt();
+                return;
+            }
             self.marking.store(false, .release);
             self.publishCollectionPhase(.full_sweep_begin);
-            self.sweepPhase(&v);
+            if (!self.sweepPhase(&v)) {
+                self.abortMarkAttempt();
+                return;
+            }
             self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.runAfterSweep();
@@ -1724,6 +1780,7 @@ pub fn Heap(comptime Binding: type) type {
         pub fn collectAndCompact(self: *Self) CompactionResult {
             if (comptime !supports_relocation) return .{ .status = .unsupported };
             self.collect();
+            if (self.markWorkPublicationFailed()) return .{ .status = .out_of_memory };
             return self.compactLiveCells();
         }
 
@@ -1909,10 +1966,11 @@ pub fn Heap(comptime Binding: type) type {
                 return .{ .status = .no_candidates };
             if (self.nursery_force_full.load(.acquire)) {
                 self.collect();
-                return .{ .status = .unsupported };
+                return .{ .status = if (self.markWorkPublicationFailed()) .out_of_memory else .unsupported };
             }
             self.moving_minor_cycle = moving;
             defer self.moving_minor_cycle = false;
+            self.beginMarkAttempt();
             self.last_minor_moved_cells = 0;
             self.last_minor_moved_bytes = 0;
 
@@ -1938,15 +1996,15 @@ pub fn Heap(comptime Binding: type) type {
             }
             self.marked_count = 0;
             self.mark_stack.clearRetainingCapacity();
-            self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch {};
+            self.mark_stack.ensureTotalCapacity(self.aux, self.young_cells) catch self.noteMarkWorkFailure();
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
             self.weak_atomic_slots.clearRetainingCapacity();
             // A minor cycle can still trace old roots/remembered owners that
             // register weak slots, so reserve to the full live-cell bound rather
             // than only the young-cell count.
-            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
-            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.unlockWeak();
             self.addr_index_built = false;
             self.marking.store(true, .release);
@@ -1982,10 +2040,17 @@ pub fn Heap(comptime Binding: type) type {
             for (self.remembered_targets.items) |h| v.mark(payloadOf(h));
             self.unlockRemember();
             while (self.mark_stack.pop()) |h| Binding.trace(payloadOf(h), h.kind, &v);
+            if (self.markWorkPublicationFailed()) {
+                self.abortMarkAttempt();
+                return .{ .status = .out_of_memory };
+            }
             self.retainRememberedForMinorSweep();
             self.marking.store(false, .release);
             self.publishCollectionPhase(.minor_sweep_begin);
-            self.sweepPhase(&v);
+            if (!self.sweepPhase(&v)) {
+                self.abortMarkAttempt();
+                return .{ .status = .out_of_memory };
+            }
             const relocation = if (moving)
                 self.compactSelectedCells(.minor_survivor)
             else
@@ -2036,6 +2101,10 @@ pub fn Heap(comptime Binding: type) type {
         pub fn beginConcurrentMark(self: *Self) void {
             self.startMarking(); // whiten + trace roots into mark_stack
             self.barrier_buf.clearRetainingCapacity();
+            // Every pre-existing cell can win the white->grey claim at most
+            // once. Reserve that exact upper bound before mutators resume so
+            // the write barrier only publishes into owned storage.
+            self.barrier_buf.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.born_concurrent.clearRetainingCapacity();
             self.deferred_trace.clearRetainingCapacity();
             self.concurrent.store(true, .release);
@@ -2077,6 +2146,7 @@ pub fn Heap(comptime Binding: type) type {
         /// Requires `parallel`.
         pub fn beginConcurrentMarkParallel(self: *Self) void {
             std.debug.assert(self.parallel);
+            self.beginMarkAttempt();
             self.publishCollectionPhase(.full_prepare_begin);
             self.collection_kind = .full;
             self.lockAlloc();
@@ -2093,17 +2163,18 @@ pub fn Heap(comptime Binding: type) type {
             // it for the whole cycle without reallocating from `aux`, so its
             // writes never reuse a page a mutator just freed from a side-store
             // mid-mark — the cross-thread allocator page-reuse TSan flags.
-            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.mark_stack.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.lockWeak();
             self.weak_slots.clearRetainingCapacity();
             self.weak_atomic_slots.clearRetainingCapacity();
             // See `startMarking`: weak-slot scratch is marker-side state, but it
             // must not allocate from `aux` while parallel mutators are growing
             // object backing stores.
-            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
-            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch {};
+            self.weak_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
+            self.weak_atomic_slots.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.unlockWeak();
             self.barrier_buf.clearRetainingCapacity();
+            self.barrier_buf.ensureTotalCapacity(self.aux, self.live_cells) catch self.noteMarkWorkFailure();
             self.born_concurrent.clearRetainingCapacity();
             self.deferred_trace.clearRetainingCapacity();
             self.addr_index_built = false;
@@ -2124,6 +2195,7 @@ pub fn Heap(comptime Binding: type) type {
         /// stack and the hand-off buffer were empty this round (a quiescent
         /// point — not final until the world is stopped for `finishConcurrentMark`).
         pub fn concurrentMarkRound(self: *Self) bool {
+            if (self.markWorkPublicationFailed()) return true;
             var v = Visitor{ .heap = self };
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
@@ -2131,10 +2203,11 @@ pub fn Heap(comptime Binding: type) type {
             self.lockBarrier();
             const handed = self.barrier_buf.items.len;
             if (handed > 0) {
-                self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {
+                if (self.appendMarkSlice(self.barrier_buf.items)) {
+                    self.barrier_buf.clearRetainingCapacity();
+                } else {
                     v.oom = true;
-                };
-                self.barrier_buf.clearRetainingCapacity();
+                }
             }
             self.unlockBarrier();
             return handed == 0 and self.mark_stack.items.len == 0;
@@ -2146,14 +2219,16 @@ pub fn Heap(comptime Binding: type) type {
         pub fn finishConcurrentMark(self: *Self) void {
             std.debug.assert(self.marking.load(.acquire) and self.concurrent.load(.acquire));
             self.concurrent.store(false, .release); // world is stopped; claims need not be atomic now
+            if (self.markWorkPublicationFailed()) {
+                self.abortMarkAttempt();
+                return;
+            }
             var v = Visitor{ .heap = self };
-            self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
-            self.barrier_buf.clearRetainingCapacity();
+            if (self.appendMarkSlice(self.barrier_buf.items)) self.barrier_buf.clearRetainingCapacity();
             // Fold in cells born during the cycle: now world-stopped, their
             // payloads are complete, so tracing them is safe. They are already
             // marked; tracing discovers and marks their children.
-            self.mark_stack.appendSlice(self.aux, self.born_concurrent.items) catch {};
-            self.born_concurrent.clearRetainingCapacity();
+            if (self.appendMarkSlice(self.born_concurrent.items)) self.born_concurrent.clearRetainingCapacity();
             // Cells whose tracing was deferred (mutable storage unsafe to read
             // mid-mark) are traced now — world stopped, storage stable. They are
             // already marked; trace discovers their (possibly white) children.
@@ -2163,9 +2238,16 @@ pub fn Heap(comptime Binding: type) type {
             while (self.mark_stack.pop()) |h| {
                 Binding.trace(payloadOf(h), h.kind, &v);
             }
+            if (self.markWorkPublicationFailed()) {
+                self.abortMarkAttempt();
+                return;
+            }
             self.marking.store(false, .release);
             self.publishCollectionPhase(.full_sweep_begin);
-            self.sweepPhase(&v);
+            if (!self.sweepPhase(&v)) {
+                self.abortMarkAttempt();
+                return;
+            }
             self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.runAfterSweep();
@@ -2210,6 +2292,7 @@ pub fn Heap(comptime Binding: type) type {
         pub fn finishConcurrentMarkParallel(self: *Self) bool {
             std.debug.assert(self.parallel and self.marking.load(.acquire) and self.concurrent.load(.acquire));
             var v = Visitor{ .heap = self };
+            if (self.markWorkPublicationFailed()) return false;
             // Fold the born cells (initialized, per the caller's stability
             // guarantee) and any deferred cells under `alloc_lock` so a peer
             // can't append a fresh half-built born cell while we read the list.
@@ -2217,11 +2300,17 @@ pub fn Heap(comptime Binding: type) type {
             // references (e.g. an `Environment.parent`) which the insertion
             // barrier does NOT cover — so their (possibly white) parents survive.
             self.lockAlloc();
-            self.mark_stack.appendSlice(self.aux, self.born_concurrent.items) catch {};
-            self.born_concurrent.clearRetainingCapacity();
-            for (self.deferred_trace.items) |h| self.mark_stack.append(self.aux, h) catch {};
-            self.deferred_trace.clearRetainingCapacity();
+            if (self.appendMarkSlice(self.born_concurrent.items)) self.born_concurrent.clearRetainingCapacity();
+            var deferred_published = true;
+            for (self.deferred_trace.items) |h| {
+                if (!self.appendMarkHeader(h)) {
+                    deferred_published = false;
+                    break;
+                }
+            }
+            if (deferred_published) self.deferred_trace.clearRetainingCapacity();
             self.unlockAlloc();
+            if (self.markWorkPublicationFailed()) return false;
             // Re-scan the collector-safe roots (the driver leaves `traceRoots` in
             // parallel mode: realm roots locked + the collector's own interpreter;
             // running peers self-published), then drain to closure, folding any
@@ -2234,12 +2323,13 @@ pub fn Heap(comptime Binding: type) type {
                 self.lockBarrier();
                 const handed = self.barrier_buf.items.len;
                 if (handed > 0) {
-                    self.mark_stack.appendSlice(self.aux, self.barrier_buf.items) catch {};
-                    self.barrier_buf.clearRetainingCapacity();
+                    if (self.appendMarkSlice(self.barrier_buf.items)) self.barrier_buf.clearRetainingCapacity();
                 }
                 self.unlockBarrier();
+                if (self.markWorkPublicationFailed()) return false;
                 if (handed == 0 and self.mark_stack.items.len == 0) break;
             }
+            if (self.markWorkPublicationFailed()) return false;
             // Sweep ONLY if no peer allocated during the trace/drain above — i.e.
             // `born_concurrent` is still empty. A non-empty list means new cells
             // were born whose creation-time references we didn't trace and whose
@@ -2260,7 +2350,10 @@ pub fn Heap(comptime Binding: type) type {
             self.marking.store(false, .release);
             self.concurrent.store(false, .release);
             self.publishCollectionPhase(.full_sweep_begin);
-            self.sweepPhaseLocked(&v); // alloc_lock already held
+            if (!self.sweepPhaseLocked(&v)) { // alloc_lock already held
+                self.unlockAlloc();
+                return false;
+            }
             self.publishCollectionPhase(.full_sweep_end);
             self.reopenShardedPublication();
             self.unlockAlloc();
@@ -2303,14 +2396,10 @@ pub fn Heap(comptime Binding: type) type {
             return self.young_bytes + pending.young_bytes >= self.nursery_threshold_bytes;
         }
 
-        /// Abort an in-progress parallel concurrent mark WITHOUT sweeping: clear
-        /// the marking state and the scratch buffers, freeing nothing. Sound at
-        /// any time — an aborted mark just leaves some cells marked (re-whitened
-        /// by the next `beginConcurrentMarkParallel` / `startMarking`). The driver
-        /// calls this when it can't reach a stable finish within its round budget
-        /// (heavy continuous allocation, or a deferred generator), falling back to
-        /// the next quiescent `collect`.
-        pub fn abortConcurrentMarkParallel(self: *Self) void {
+        /// Abandon any mark attempt without weak clearing or sweep. Partial mark
+        /// bits are disposable: the next attempt whitens the eligible graph.
+        fn abortMarkAttempt(self: *Self) void {
+            const aborted_kind = self.collection_kind;
             self.marking.store(false, .release);
             self.concurrent.store(false, .release);
             self.lockBarrier();
@@ -2318,10 +2407,24 @@ pub fn Heap(comptime Binding: type) type {
             self.unlockBarrier();
             self.lockAlloc();
             self.born_concurrent.clearRetainingCapacity();
+            self.aborted_collections += 1;
             self.unlockAlloc();
             self.mark_stack.clearRetainingCapacity();
+            self.lockWeak();
+            self.weak_slots.clearRetainingCapacity();
+            self.weak_atomic_slots.clearRetainingCapacity();
+            self.unlockWeak();
             self.deferred_trace.clearRetainingCapacity();
+            self.addr_index_built = false;
+            self.collection_kind = .full;
             self.reopenShardedPublication();
+            self.publishCollectionPhase(if (aborted_kind == .minor) .minor_abort else .full_abort);
+        }
+
+        /// Abort an in-progress parallel concurrent mark after the embedding's
+        /// terminal handshake could not reach a stable finish. Frees no cells.
+        pub fn abortConcurrentMarkParallel(self: *Self) void {
+            self.abortMarkAttempt();
         }
 
         /// The ephemeron-fixpoint + weak-edge + sweep tail shared by the
@@ -2336,12 +2439,10 @@ pub fn Heap(comptime Binding: type) type {
         /// Finalizers run here must not allocate from this heap (they would
         /// re-enter `lockAlloc` — a non-reentrant leaf spinlock); this engine's
         /// finalizers only release native side storage, never allocate cells.
-        fn sweepPhase(self: *Self, v: *Visitor) void {
-            {
-                if (self.parallel) self.lockAlloc();
-                defer if (self.parallel) self.unlockAlloc();
-                self.sweepPhaseLocked(v);
-            }
+        fn sweepPhase(self: *Self, v: *Visitor) bool {
+            if (self.parallel) self.lockAlloc();
+            defer if (self.parallel) self.unlockAlloc();
+            return self.sweepPhaseLocked(v);
         }
 
         /// Let the embedder drain work queued by cell finalizers after the
@@ -2355,15 +2456,7 @@ pub fn Heap(comptime Binding: type) type {
         /// The sweep tail proper, assuming `alloc_lock` is already held under
         /// `parallel` (the parallel finish holds it across its born-empty check
         /// and the sweep so no cell is born in between).
-        fn sweepPhaseLocked(self: *Self, v: *Visitor) void {
-            // Full marking does not consume the generational frontier. Drop its
-            // pre-mark snapshot before freeing anything: unlike minor GC, a full
-            // sweep may reclaim remembered owners/targets, so clearing their bits
-            // afterward would dereference dead headers. Parallel mutators can add
-            // fresh entries after this point; closure guarantees those cells are
-            // marked, and the final clear below safely discards those late cards.
-            if (self.collection_kind == .full) self.clearRemembered();
-
+        fn sweepPhaseLocked(self: *Self, v: *Visitor) bool {
             // A binding can conservatively prove that it has never published
             // weak semantic state. In that common case all three passes below
             // are empty, and avoiding their all-list walks is material for
@@ -2387,6 +2480,12 @@ pub fn Heap(comptime Binding: type) type {
                         if (self.marked_count == before) break;
                     }
                 }
+
+                // A white->grey claim without durable work ownership makes
+                // the graph closure incomplete. Stop before clearing a weak
+                // slot or freeing a cell; abort cleanup resets the attempt and
+                // a later collection whitens and traces the full graph again.
+                if (self.markWorkPublicationFailed()) return false;
 
                 // 3. weak edges whose target died are cleared *before* the
                 // sweep frees it, so no slot ever dangles.
@@ -2417,6 +2516,13 @@ pub fn Heap(comptime Binding: type) type {
                     }
                 }
             }
+
+            if (self.markWorkPublicationFailed()) return false;
+            // Full marking does not consume the generational frontier. Drop its
+            // pre-mark snapshot only after closure is proven and immediately
+            // before freeing anything: an aborted attempt preserves every old
+            // card, while a successful full sweep may reclaim their headers.
+            if (self.collection_kind == .full) self.clearRemembered();
 
             // 4. sweep the white cells.
             const minor = self.collection_kind == .minor;
@@ -2543,6 +2649,7 @@ pub fn Heap(comptime Binding: type) type {
             if (!minor) self.clearRemembered();
             self.nursery_force_full.store(false, .release);
             self.trimCollectorScratch();
+            return true;
         }
 
         fn shouldProcessMarkedCell(self: *Self, h: *Header) bool {
@@ -2754,6 +2861,10 @@ const TestRT = struct {
         switch (kind) {
             .node => {
                 const n: *Node = @ptrCast(@alignCast(cell));
+                if (n.id == std.math.maxInt(u32) - 1 and v.concurrent()) {
+                    v.deferToFinish(n);
+                    return;
+                }
                 // Under a concurrent mark the mutator may store into `strong`
                 // while we read it (it then fires the barrier, so the new target
                 // is marked regardless). The read is `.acquire` and the mutator's
@@ -3313,6 +3424,92 @@ test "mark-sweep: cycles survive via a root, garbage is swept, weak edges clear"
     try std.testing.expectEqual(@as(usize, 3), rt.finalized.items.len);
 }
 
+test "mark-work OOM aborts before sweep and the heap remains reusable" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(unavailable.allocator());
+    defer heap.deinit();
+
+    const root = try heap.create(TestRT.Node, .node);
+    root.* = .{ .id = 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    root.strong = child;
+    try rt.roots.append(a, root);
+
+    const compaction = heap.collectAndCompact();
+    try std.testing.expect(unavailable.has_induced_failure);
+    try std.testing.expectEqual(Heap(TestRT).CompactionStatus.out_of_memory, compaction.status);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expect(!heap.marking.load(.acquire));
+    try std.testing.expect(!heap.concurrent.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    const aborted = heap.accounting();
+    try std.testing.expectEqual(@as(usize, 0), aborted.collections);
+    try std.testing.expectEqual(@as(usize, 1), aborted.aborted_collections);
+    try std.testing.expectEqual(@as(usize, 0), rt.after_sweep_calls);
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .full_prepare_begin,
+        .full_trace_begin,
+        .full_abort,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+
+    // The abort leaves mark bits disposable, not authoritative. Once scratch
+    // allocation recovers, a fresh whiten/trace pass preserves the graph and a
+    // later root removal reclaims it normally.
+    unavailable.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    rt.roots.clearRetainingCapacity();
+    heap.collect();
+    try std.testing.expectEqual(@as(usize, 0), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 2), rt.finalized.items.len);
+}
+
+test "weak-work OOM preserves the slot and aborts before reclaim" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    // The mark-stack reserve is allocation zero; fail the following weak-slot
+    // reserve so strong marking can complete but weak ownership cannot.
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(unavailable.allocator());
+    defer heap.deinit();
+
+    const root = try heap.create(TestRT.Node, .node);
+    root.* = .{ .id = 1 };
+    const weak_target = try heap.create(TestRT.Node, .node);
+    weak_target.* = .{ .id = 2 };
+    root.weak = weak_target;
+    try rt.roots.append(a, root);
+
+    heap.collect();
+    try std.testing.expect(unavailable.has_induced_failure);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(?*anyopaque, weak_target), root.weak);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rt.after_sweep_calls);
+
+    unavailable.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 1), heap.live_cells);
+    try std.testing.expectEqual(@as(?*anyopaque, null), root.weak);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
 test "stop-the-world compaction rewrites cycles weak roots and pinned edges" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -3668,6 +3865,49 @@ test "nursery reclaims young garbage and tenures root survivors" {
     try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
     heap.threshold_bytes = 1;
     try std.testing.expect(heap.shouldCollectOld());
+}
+
+test "nursery mark-work OOM aborts without promotion or reclaim" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(unavailable.allocator());
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+    heap.setMovingNurseryEnabled(true);
+
+    const root = try heap.create(TestRT.Node, .node);
+    root.* = .{ .id = 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    root.strong = child;
+    const garbage = try heap.create(TestRT.Node, .node);
+    garbage.* = .{ .id = 3 };
+    try rt.roots.append(a, root);
+
+    const failed = heap.collectYoungAndCompact();
+    try std.testing.expectEqual(Heap(TestRT).CompactionStatus.out_of_memory, failed.status);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 3), heap.young_cells);
+    try std.testing.expectEqual(@as(usize, 0), heap.promoted_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .minor_prepare_begin,
+        .minor_trace_begin,
+        .minor_abort,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+
+    unavailable.fail_index = std.math.maxInt(usize);
+    heap.collectYoung();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 3), rt.finalized.items[0]);
 }
 
 test "multi-age nursery retains survivors and promotes at the configured age" {
@@ -4537,6 +4777,60 @@ test "nursery binding-selected old ephemerons retain values only for live keys" 
     try std.testing.expectEqual(@as(usize, 2), rt.finalized.items.len);
 }
 
+test "nursery old-container publication OOM aborts before sweeping ephemeron values" {
+    const a = std.testing.allocator;
+    var scratch = std.testing.FailingAllocator.init(a, .{});
+    var rt = EphRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var heap = Heap(EphRT).init(a, &rt);
+    heap.setAuxAllocator(scratch.allocator());
+    defer heap.deinit();
+    heap.setNurseryEnabled(true);
+
+    const key = try heap.create(EphRT.Node, .node);
+    key.* = .{ .id = 1 };
+    const table = try heap.create(EphRT.Table, .table);
+    table.* = .{};
+    try rt.roots.append(a, table);
+    try rt.roots.append(a, key);
+    heap.collectYoung();
+    heap.clearRemembered();
+    heap.remembered_owners.clearAndFree(scratch.allocator());
+
+    const value = try heap.create(EphRT.Node, .node);
+    value.* = .{ .id = 2 };
+    const dead_key = try heap.create(EphRT.Node, .node);
+    dead_key.* = .{ .id = 3 };
+    const dead_value = try heap.create(EphRT.Node, .node);
+    dead_value.* = .{ .id = 4 };
+    try table.entries.append(a, .{ .key = key, .value = value });
+    try table.entries.append(a, .{ .key = dead_key, .value = dead_value });
+
+    // Keep setup allocations away from the boundary under test. The selected
+    // old table is the only list whose first publication must now allocate.
+    try heap.mark_stack.ensureTotalCapacityPrecise(scratch.allocator(), heap.live_cells);
+    try heap.weak_slots.ensureTotalCapacityPrecise(scratch.allocator(), heap.live_cells);
+    try heap.weak_atomic_slots.ensureTotalCapacityPrecise(scratch.allocator(), heap.live_cells);
+    scratch.fail_index = scratch.alloc_index;
+    heap.collectYoung();
+
+    try std.testing.expect(scratch.has_induced_failure);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 5), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 1), heap.accounting().aborted_collections);
+
+    scratch.fail_index = std.math.maxInt(usize);
+    heap.collectYoung(); // forced full retry from the remembered-set failure
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), table.entries.items.len);
+    try std.testing.expectEqual(value, table.entries.items[0].value.?);
+    try std.testing.expectEqual(@as(usize, 2), rt.finalized.items.len);
+}
+
 test "incremental mark: stepped drain matches stop-the-world reachability" {
     const a = std.testing.allocator;
     var rt = TestRT{};
@@ -4861,6 +5155,168 @@ test "concurrent mark: cells allocated mid-cycle are deferred (born_concurrent) 
     try std.testing.expectEqual(@as(usize, 1000), count);
 }
 
+test "concurrent barrier publishes from cycle-reserved storage" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var scratch = std.testing.FailingAllocator.init(a, .{});
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(scratch.allocator());
+    defer heap.deinit();
+
+    const holder = try heap.create(TestRT.Node, .node);
+    holder.* = .{ .id = 1 };
+    const donor = try heap.create(TestRT.Node, .node);
+    donor.* = .{ .id = 2 };
+    const orphan = try heap.create(TestRT.Node, .node);
+    orphan.* = .{ .id = 3 };
+    donor.strong = orphan;
+    try rt.roots.append(a, holder);
+
+    heap.beginConcurrentMark();
+    while (!heap.concurrentMarkRound()) {}
+    scratch.fail_index = scratch.alloc_index;
+    holder.strong = orphan;
+    heap.writeBarrier(orphan);
+    donor.strong = null;
+    try std.testing.expect(!scratch.has_induced_failure);
+
+    heap.finishConcurrentMark();
+    try std.testing.expect(!scratch.has_induced_failure);
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 1), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(u32, 2), rt.finalized.items[0]);
+}
+
+test "concurrent born and finish-transfer OOM abort before sweep" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var scratch = std.testing.FailingAllocator.init(a, .{});
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(scratch.allocator());
+    defer heap.deinit();
+
+    const anchor = try heap.create(TestRT.Node, .node);
+    anchor.* = .{ .id = 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    try rt.roots.append(a, anchor);
+
+    heap.beginConcurrentMark();
+    while (!heap.concurrentMarkRound()) {}
+    const born_count = heap.mark_stack.capacity + 1;
+    for (0..born_count) |index| {
+        const born = try heap.create(TestRT.Node, .node);
+        born.* = .{
+            .id = @intCast(index + 3),
+            .strong = if (index == 0) child else null,
+        };
+        try rt.roots.append(a, born);
+    }
+
+    // Exceed the exact pre-cycle mark-stack capacity with initialized born
+    // cells, then fail its required finish-time growth.
+    scratch.fail_index = scratch.alloc_index;
+    heap.finishConcurrentMark();
+
+    try std.testing.expect(scratch.has_induced_failure);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expect(!heap.marking.load(.acquire));
+    try std.testing.expect(!heap.concurrent.load(.acquire));
+    try std.testing.expectEqual(2 + born_count, heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 1), heap.accounting().aborted_collections);
+    try std.testing.expectEqual(@as(usize, 0), rt.after_sweep_calls);
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .full_prepare_begin,
+        .full_trace_begin,
+        .full_abort,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+
+    scratch.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(2 + born_count, heap.live_cells);
+}
+
+test "concurrent born-cell trace-work OOM retains its graph" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var scratch = std.testing.FailingAllocator.init(a, .{});
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(scratch.allocator());
+    defer heap.deinit();
+
+    const anchor = try heap.create(TestRT.Node, .node);
+    anchor.* = .{ .id = 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    try rt.roots.append(a, anchor);
+
+    heap.beginConcurrentMark();
+    while (!heap.concurrentMarkRound()) {}
+    scratch.fail_index = scratch.alloc_index;
+    const born = try heap.create(TestRT.Node, .node);
+    born.* = .{ .id = 3, .strong = child };
+    try rt.roots.append(a, born);
+    heap.finishConcurrentMark();
+
+    try std.testing.expect(scratch.has_induced_failure);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 0), rt.after_sweep_calls);
+
+    scratch.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 3), heap.live_cells);
+}
+
+test "concurrent deferred-trace publication OOM retains its graph" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var scratch = std.testing.FailingAllocator.init(a, .{});
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(scratch.allocator());
+    defer heap.deinit();
+
+    const root = try heap.create(TestRT.Node, .node);
+    root.* = .{ .id = std.math.maxInt(u32) - 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    root.strong = child;
+    try rt.roots.append(a, root);
+
+    heap.beginConcurrentMark();
+    scratch.fail_index = scratch.alloc_index;
+    while (!heap.concurrentMarkRound()) {}
+    heap.finishConcurrentMark();
+
+    try std.testing.expect(scratch.has_induced_failure);
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 1), heap.accounting().aborted_collections);
+
+    scratch.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+}
+
 test "parallel: multiple mutators allocate concurrently without corrupting the heap" {
     // The first GIL-removal prerequisite: cell allocation must be thread-safe so
     // several mutators can `create` at once. With `setParallel`, the all-list
@@ -4905,6 +5361,46 @@ test "parallel: multiple mutators allocate concurrently without corrupting the h
     var it = heap.all;
     while (it) |hdr| : (it = hdr.next) walked += 1;
     try std.testing.expectEqual(@as(usize, threads * per), walked);
+}
+
+test "parallel concurrent mark-work OOM requires abort before sweep" {
+    const a = std.testing.allocator;
+    var rt = TestRT{};
+    defer rt.roots.deinit(a);
+    defer rt.finalized.deinit(a);
+
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var heap = Heap(TestRT).init(a, &rt);
+    heap.setAuxAllocator(unavailable.allocator());
+    heap.setParallel(true);
+    defer heap.deinit();
+
+    const root = try heap.create(TestRT.Node, .node);
+    root.* = .{ .id = 1 };
+    const child = try heap.create(TestRT.Node, .node);
+    child.* = .{ .id = 2 };
+    root.strong = child;
+    try rt.roots.append(a, root);
+
+    heap.beginConcurrentMarkParallel();
+    try std.testing.expect(heap.markWorkPublicationFailed());
+    try std.testing.expect(!heap.finishConcurrentMarkParallel());
+    heap.abortConcurrentMarkParallel();
+    try std.testing.expect(!heap.marking.load(.acquire));
+    try std.testing.expect(!heap.concurrent.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
+    try std.testing.expectEqual(@as(usize, 0), rt.finalized.items.len);
+    try std.testing.expectEqual(@as(usize, 1), heap.accounting().aborted_collections);
+    try std.testing.expectEqualSlices(CollectionPhaseBoundary, &.{
+        .full_prepare_begin,
+        .full_trace_begin,
+        .full_abort,
+    }, rt.collection_phase_boundaries[0..rt.collection_phase_boundary_len]);
+
+    unavailable.fail_index = std.math.maxInt(usize);
+    heap.collect();
+    try std.testing.expect(!heap.markWorkPublicationFailed());
+    try std.testing.expectEqual(@as(usize, 2), heap.live_cells);
 }
 
 test "createBatch publishes nursery cells under one allocation lock" {

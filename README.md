@@ -131,10 +131,11 @@ heap by implementing:
 fn collectionPhaseBoundary(ctx: *B, boundary: gc.CollectionPhaseBoundary) void;
 ```
 
-The full/minor prepare, trace, sweep, and post-sweep boundaries describe exact
-collector ordering; the post-sweep event follows `afterSweep`. Empty nursery
-calls emit nothing, and a forced full fallback emits only full boundaries. The
-hook is resolved at comptime and compiles away entirely when absent.
+The full/minor prepare, trace, sweep, post-sweep, and abort boundaries describe
+exact collector ordering; the post-sweep event follows `afterSweep`, while an
+abort confirms that weak clearing and sweep were skipped. Empty nursery calls
+emit nothing, and a forced full fallback emits only full boundaries. The hook
+is resolved at comptime and compiles away entirely when absent.
 
 ### Optional relocation
 
@@ -219,8 +220,9 @@ batch reports its successfully published prefix so the caller can commit that
 work before the next allocation performs recovery or reports OOM, preserving
 sequential failure ordering.
 
-`accounting()` snapshots live/young/promoted totals, collection counts, the
-configured tenuring age, the latest minor survivor/reclamation/promotion bytes,
+`accounting()` snapshots live/young/promoted totals, completed and aborted
+collection counts, the configured tenuring age, the latest minor
+survivor/reclamation/promotion bytes,
 cumulative young-input/survivor/reclamation/promotion bytes across all minor
 cycles, and the post-sweep byte size of the last full collection. The cumulative
 counters are historical and do not reset on a full collection or nursery toggle.
@@ -232,11 +234,18 @@ prefix.
 ## Status
 
 The collector supports stop-the-world, incremental, concurrent, parallel, and
-configurable multi-age nursery paths, plus opt-in stop-the-world relocation. The
-default remains non-moving with one-cycle tenuring until an embedder selects a
-higher age. Unit and TSan gates cover cycles, weak/finalization semantics,
-allocation/publication races, relocation rollback, pinned/moved graphs, and
-exact accounting.
+configurable multi-age nursery paths, plus opt-in stop-the-world relocation.
+Every white-to-grey claim either gains durable trace-work ownership or marks
+the current attempt unsweepable; a collector-scratch OOM aborts before weak
+clearing or sweep, leaves all cells live, and permits a fresh whiten-and-trace
+retry. Concurrent cycle setup reserves the exact pre-existing-cell bound for
+its mutator barrier, so
+ordinary stores do not allocate. The aborted-collection counter also records
+parallel finishes that cannot stabilize within the embedding's bounded
+handshake. The default remains non-moving with one-cycle tenuring until an
+embedder selects a higher age. Unit and TSan gates cover cycles,
+weak/finalization semantics, allocation/publication races, relocation rollback,
+pinned/moved graphs, and exact accounting.
 
 ## Community
 
